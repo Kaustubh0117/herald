@@ -1,0 +1,8 @@
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10",
+              "-c", "max_wal_senders=10", "-c", "max_slot_wal_keep_size=2GB"]
+    environment: { POSTGRES_PASSWORD: herald }
+    ports: ["5432:5432"]
+  # add prometheus + grafana here in Phase 10
