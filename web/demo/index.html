@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Herald demo store</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2430; --muted: #687385; --line: #e3e6eb;
+    --accent: #0f766e; --flash: #ccfbf1; --danger: #b42318;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1419; --card: #182028; --text: #e6e9ee; --muted: #8b96a5; --line: #2a3440;
+            --accent: #2dd4bf; --flash: #134e4a; --danger: #f97066; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+  h1 { margin: 0; font-size: 22px; }
+  h1 small { color: var(--muted); font-weight: 400; font-size: 14px; margin-left: 6px; }
+  .status { font-size: 13px; color: var(--muted); }
+  .status b { color: var(--accent); }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--danger);
+           background: transparent; color: var(--danger); cursor: pointer; }
+  button:hover { background: var(--danger); color: var(--card); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin: 20px 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px;
+          transition: background-color 1.2s ease; }
+  .card.flash { background: var(--flash); transition: none; }
+  .name { font-weight: 600; }
+  .price { font-size: 28px; font-weight: 700; margin: 6px 0; font-variant-numeric: tabular-nums; }
+  .meta { font-size: 12px; color: var(--muted); font-family: ui-monospace, monospace; }
+  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  #log { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px;
+         font: 12px/1.6 ui-monospace, monospace; max-height: 260px; overflow: auto; margin: 0; }
+  code { background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Demo store <small>live via Herald</small></h1>
+    <span class="status" id="status">connecting…</span>
+    <button id="wipe" title="Delete all of Herald's server state">Wipe Herald</button>
+  </header>
+  <p class="status">Try it: in psql run <code>UPDATE products SET price = 12 WHERE id = 1;</code>
+     — no polling, no TTL. Then press Wipe Herald and update again.</p>
+  <div class="grid" id="grid"></div>
+  <h2>Events</h2>
+  <pre id="log"></pre>
+</main>
+<script type="module">
+  import { HeraldClient } from "/herald-client.js";
+
+  const grid = document.getElementById("grid");
+  const logEl = document.getElementById("log");
+  const statusEl = document.getElementById("status");
+  let products = new Map();
+  const versions = new Map();
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent = `${t}  ${msg}\n` + logEl.textContent;
+  }
+
+  function render(changed = new Set()) {
+    grid.replaceChildren(...[...products.values()].map((p) => {
+      const el = document.createElement("div");
+      el.className = "card" + (changed.has(p.id) ? " flash" : "");
+      const v = versions.get(`products:${p.id}`);
+      el.innerHTML = `<div class="name"></div><div class="price"></div>
+        <div class="meta">products:${p.id} · ${v ? "v" + v : "version unknown"}</div>`;
+      el.querySelector(".name").textContent = p.name;
+      el.querySelector(".price").textContent = `$${p.price}`;
+      return el;
+    }));
+    requestAnimationFrame(() => grid.querySelectorAll(".flash").forEach((e) => e.classList.remove("flash")));
+  }
+
+  // The app's own backend is the source of data; Herald only says "refetch".
+  async function refetch() {
+    const rows = await (await fetch("/api/products")).json();
+    const next = new Map(rows.map((p) => [p.id, p]));
+    const changed = new Set(rows.filter((p) => JSON.stringify(products.get(p.id)) !== JSON.stringify(p)).map((p) => p.id));
+    products = next;
+    render(changed);
+    for (const p of rows) herald.register(`products:${p.id}`);
+  }
+
+  const herald = new HeraldClient(`${location.origin.replace("http", "ws")}/ws`, {
+    notify(obj, v) { versions.set(obj, v); log(`notify ${obj} v${v}`); refetch(); },
+    notifyUnknown(obj) { log(`unknown ${obj}: refetching`); refetch(); },
+  }, { tickMs: 5000 });
+
+  herald.register("products:*"); // anything in the table: inserts and deletes too
+  herald.start();
+  setInterval(() => {
+    const open = herald.ws?.readyState === WebSocket.OPEN;
+    statusEl.innerHTML = open ? `<b>●</b> connected · client ${herald.tok?.Client ?? "…"} · epoch ${herald.tok?.Epoch ?? "…"}`
+                              : "reconnecting…";
+  }, 500);
+  refetch();
+
+  document.getElementById("wipe").onclick = async () => {
+    await fetch("/admin/wipe", { method: "POST" });
+    log("WIPED all Herald server state");
+  };
+</script>
+</body>
+</html>

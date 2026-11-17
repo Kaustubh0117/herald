@@ -10,6 +10,18 @@ while it's running without losing an update. It is a re-implementation of Google
 
 **Status:** under construction.
 
+## Quick start
+
+```sh
+make dev                  # one-process cell + Bridge + demo store on :8080
+open http://localhost:8080
+psql -d postgres -c "UPDATE products SET price = 12 WHERE id = 1"   # the page updates live
+```
+
+`make dev` creates a demo `products` table, a publication and a replication slot
+(`herald_dev`) in the database named by `PG`. The slot keeps WAL while herald-dev is
+stopped; drop it when you're done: `SELECT pg_drop_replication_slot('herald_dev');`.
+
 ## Correctness
 
 **Property** (paper §5): if a well-behaved client registers for an object, it always

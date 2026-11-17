@@ -9,7 +9,7 @@ test-pg:
 	HERALD_PG=$(PG) go test -race -count=1 ./...
 
 dev:
-	go run ./cmd/herald-dev
+	go run ./cmd/herald-dev -pg $(PG)
 
 lint:
 	go vet ./... && test -z "$$(gofmt -l .)"
