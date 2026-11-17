@@ -43,3 +43,18 @@ make test      # unit tests, no database needed
 make test-pg   # also runs Postgres tests (needs wal_level=logical; see deploy/docker-compose.yml)
 bench/mutate.sh  # mutation table above
 ```
+
+## Postgres setup
+
+```sql
+-- once per database: which tables Herald watches
+CREATE PUBLICATION herald_pub FOR TABLE products, orders;   -- or FOR ALL TABLES
+-- once per Herald cell: its durable cursor into the WAL
+SELECT pg_create_logical_replication_slot('herald_cell_a', 'pgoutput');
+-- watch how much WAL a stalled Bridge is forcing Postgres to keep
+SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM pg_replication_slots;
+```
+
+Tables need a primary key so updates and deletes carry it. Each row change becomes
+`table:pk` and `table:*` notifications versioned by the transaction's commit LSN.
