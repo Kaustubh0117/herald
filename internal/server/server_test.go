@@ -228,6 +228,23 @@ func TestWipeRecoversThroughClient(t *testing.T) {
 	wantVersion(t, tc.heartbeat(), "products:1", 5)
 }
 
+func TestPreWipeAckDoesNotClearPostWipeUnknown(t *testing.T) {
+	c := NewCell("t", 1, 1, nil)
+	tc := newTestClient(t, c)
+	tc.register("products:1")
+	settle(c)
+	old, _ := pendingFor(tc.heartbeat(), "products:1") // unknown, from epoch 1
+
+	c.Wipe()
+	tc.tok = tc.heartbeat().NewToken
+	tc.fullSync()
+	settle(c)
+	tc.ack(old) // delayed ack from before the wipe
+	if n, ok := pendingFor(tc.heartbeat(), "products:1"); !ok || !n.Unknown {
+		t.Fatalf("stale ack cleared the post-wipe unknown signal: %+v ok=%v", n, ok)
+	}
+}
+
 func TestFastPathPush(t *testing.T) {
 	var pushed []p.Notification
 	c := NewCell("t", 2, 2, func(addr string, _ p.ClientID, ns []p.Notification) {

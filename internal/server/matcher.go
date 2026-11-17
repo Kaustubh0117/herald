@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/Kaustubh0117/herald/internal/mutate"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 )
 
@@ -117,7 +118,7 @@ func (m *Matcher) Propagate() {
 		}
 		m.mu.Lock()
 		// Only clear if no newer version arrived while we were propagating.
-		if ok && m.objects[j.id].version == j.v {
+		if (ok || mutate.MatcherDropsFailed) && m.objects[j.id].version == j.v {
 			delete(m.pending, j.id)
 		}
 		m.mu.Unlock()

@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/Kaustubh0117/herald/internal/mutate"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 )
 
@@ -51,12 +52,18 @@ func NewRegistrar(cell string, epoch uint64, route func(p.ObjectID) MatcherAPI, 
 }
 
 // state returns the client's state, creating it if needed. Caller holds r.mu.
+//
+// seq starts at epoch<<32 so unknown-version sequence numbers keep growing
+// across wipes. Otherwise a delayed ack for a pre-wipe "unknown, seq 3"
+// would cover (and silently clear) a post-wipe "unknown, seq 1" that the
+// client has never seen.
 func (r *Registrar) state(c p.ClientID) *clientState {
 	st, ok := r.clients[c]
 	if !ok {
 		st = &clientState{
 			regs:    map[p.ObjectID]bool{},
 			pending: map[p.ObjectID]p.Notification{},
+			seq:     r.epoch << 32,
 		}
 		r.clients[c] = st
 	}
@@ -164,6 +171,9 @@ func (r *Registrar) Handle(m p.ClientMessage) p.ServerMessage {
 	st.confirmReg, st.confirmUnreg = nil, nil
 	for _, id := range slices.Sorted(maps.Keys(st.pending)) { // retransmit everything unacked
 		resp.Notifications = append(resp.Notifications, st.pending[id])
+		if mutate.NoRetransmission {
+			delete(st.pending, id)
+		}
 	}
 	return resp
 }
@@ -236,7 +246,9 @@ func (r *Registrar) Propagate() {
 				st.seq++
 				n = p.Notification{Object: op.obj, Unknown: true, Seq: st.seq}
 			}
-			offer(st, n)
+			if !mutate.NoPostPropagation {
+				offer(st, n)
+			}
 			st.confirmReg = append(st.confirmReg, op.obj)
 		}
 		r.mu.Unlock()
