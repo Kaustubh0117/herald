@@ -9,50 +9,54 @@ import (
 
 // Cell is one complete Herald deployment (the paper's "data center"):
 // N Registrars and M Matchers in one process, routed by protocol.Owner.
+// Servers reach each other through slot wrappers that look up whichever
+// instance currently occupies a slot, so a single server can be restarted
+// (RestartMatcher, RestartRegistrar) the way a crashed process would be.
 type Cell struct {
 	// Fail, if set, is consulted before every inter-component call and
 	// fails the call when it returns true. Set it before starting any
 	// goroutine that calls Step; it is not guarded by a lock.
 	Fail func() bool
 
-	name         string
-	nReg, nMatch int
-	push         PushFunc
+	name string
+	push PushFunc
+	regs []RegistrarAPI // slot wrappers, fixed for the Cell's lifetime
+	ms   []MatcherAPI
 
 	mu         sync.Mutex
-	epoch      uint64
+	lastEpoch  uint64 // every server incarnation gets a fresh epoch
 	nextID     uint64
 	registrars []*Registrar
 	matchers   []*Matcher
 }
 
 func NewCell(name string, registrars, matchers int, push PushFunc) *Cell {
-	c := &Cell{name: name, nReg: registrars, nMatch: matchers, push: push}
-	c.build(1)
+	c := &Cell{
+		name:       name,
+		push:       push,
+		registrars: make([]*Registrar, registrars),
+		matchers:   make([]*Matcher, matchers),
+	}
+	for i := range c.registrars {
+		c.regs = append(c.regs, registrarSlot{c, i})
+	}
+	for i := range c.matchers {
+		c.ms = append(c.ms, matcherSlot{c, i})
+	}
+	c.Wipe()
 	return c
 }
 
-// build replaces every server with an empty one under the given epoch.
-// The route closures capture this generation's slices, so a propagator
-// still running on an old generation only ever touches old servers.
-// Caller holds c.mu (or is the constructor).
-func (c *Cell) build(epoch uint64) {
-	regs := make([]*Registrar, c.nReg)
-	ms := make([]*Matcher, c.nMatch)
-	routeR := func(id p.ClientID) RegistrarAPI {
-		return faultyRegistrar{c, regs[p.Owner(string(id), len(regs))]}
-	}
-	routeM := func(id p.ObjectID) MatcherAPI {
-		return faultyMatcher{c, ms[p.Owner(string(id), len(ms))]}
-	}
-	for i := range regs {
-		regs[i] = NewRegistrar(c.name, epoch, routeM, c.push)
-	}
-	for i := range ms {
-		ms[i] = NewMatcher(routeR)
-	}
-	c.epoch, c.nextID = epoch, 0
-	c.registrars, c.matchers = regs, ms
+// newRegistrar and newMatcher create an empty server under a new epoch.
+// Caller holds c.mu.
+func (c *Cell) newRegistrar() *Registrar {
+	c.lastEpoch++
+	return NewRegistrar(c.name, c.lastEpoch, c.ms, c.push)
+}
+
+func (c *Cell) newMatcher() *Matcher {
+	c.lastEpoch++
+	return NewMatcher(c.lastEpoch, c.regs)
 }
 
 // Wipe throws away ALL server state, like the paper's brute-force recovery
@@ -61,46 +65,70 @@ func (c *Cell) build(epoch uint64) {
 func (c *Cell) Wipe() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.build(c.epoch + 1)
+	for i := range c.registrars {
+		c.registrars[i] = c.newRegistrar()
+	}
+	for i := range c.matchers {
+		c.matchers[i] = c.newMatcher()
+	}
 }
 
-func (c *Cell) Epoch() uint64 {
+// RestartMatcher replaces one Matcher with an empty one, like a crashed
+// process coming back without its in-memory state.
+func (c *Cell) RestartMatcher(i int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.epoch
+	c.matchers[i] = c.newMatcher()
+}
+
+func (c *Cell) RestartRegistrar(i int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.registrars[i] = c.newRegistrar()
+}
+
+func (c *Cell) NumMatchers() int   { return len(c.ms) }
+func (c *Cell) NumRegistrars() int { return len(c.regs) }
+
+func (c *Cell) matcher(i int) *Matcher {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.matchers[i]
+}
+
+func (c *Cell) registrar(i int) *Registrar {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.registrars[i]
 }
 
 // Handle routes a client message to the client's Registrar. A handshake
-// (nil token) gets a freshly minted client ID; including the epoch keeps
-// IDs unique across wipes even though the counter restarts.
+// (nil token) gets a freshly minted client ID, passed on as a token with no
+// cell, which the Registrar treats like any stale token: it grants a real
+// one for the same ID under its own epoch.
 func (c *Cell) Handle(m p.ClientMessage) p.ServerMessage {
-	c.mu.Lock()
 	if m.Token == nil {
+		c.mu.Lock()
 		c.nextID++
-		id := p.ClientID(fmt.Sprintf("%s.%d.%d", c.name, c.epoch, c.nextID))
-		tok := p.Token{Client: id, Cell: c.name, Epoch: c.epoch}
+		id := p.ClientID(fmt.Sprintf("%s.%d", c.name, c.nextID))
 		c.mu.Unlock()
-		return p.ServerMessage{NewToken: &tok, Nonce: m.Nonce}
+		m.Token = &p.Token{Client: id}
 	}
-	r := c.registrars[p.Owner(string(m.Token.Client), len(c.registrars))]
-	c.mu.Unlock()
-	return r.Handle(m)
+	return c.registrar(p.Owner(string(m.Token.Client), len(c.regs))).Handle(m)
 }
 
 // Publish is the Bridge's entry point. It can fail (fault injection now,
 // a network error later); the caller retries until it succeeds.
 func (c *Cell) Publish(id p.ObjectID, v p.Version, source p.ClientID) error {
-	c.mu.Lock()
-	m := c.matchers[p.Owner(string(id), len(c.matchers))]
-	c.mu.Unlock()
-	return faultyMatcher{c, m}.Publish(id, v, source)
+	return c.ms[p.Owner(string(id), len(c.ms))].Publish(id, v, source)
 }
 
 // Step runs one pass of every propagator. Tests call it directly for
 // deterministic control; servers call it on a timer.
 func (c *Cell) Step() {
 	c.mu.Lock()
-	regs, ms := c.registrars, c.matchers
+	regs := append([]*Registrar(nil), c.registrars...)
+	ms := append([]*Matcher(nil), c.matchers...)
 	c.mu.Unlock()
 	for _, r := range regs {
 		r.Propagate()
@@ -112,51 +140,57 @@ func (c *Cell) Step() {
 
 func (c *Cell) fail() bool { return c.Fail != nil && c.Fail() }
 
-// faultyMatcher and faultyRegistrar wrap every inter-component call in the
-// Cell's fault injector, standing in for a lossy network between servers.
-type faultyMatcher struct {
+// matcherSlot and registrarSlot call whichever server currently occupies
+// slot i, through the Cell's fault injector: they stand in for an RPC
+// client and a lossy network between servers.
+type matcherSlot struct {
 	c *Cell
-	m *Matcher
+	i int
 }
 
-func (f faultyMatcher) Publish(id p.ObjectID, v p.Version, src p.ClientID) error {
-	if f.c.fail() {
+func (s matcherSlot) Publish(id p.ObjectID, v p.Version, src p.ClientID) error {
+	if s.c.fail() {
 		return ErrInjected
 	}
-	return f.m.Publish(id, v, src)
+	return s.c.matcher(s.i).Publish(id, v, src)
 }
 
-func (f faultyMatcher) AddRegistration(id p.ObjectID, cl p.ClientID) error {
-	if f.c.fail() {
+func (s matcherSlot) AddRegistration(id p.ObjectID, cl p.ClientID) error {
+	if s.c.fail() {
 		return ErrInjected
 	}
-	return f.m.AddRegistration(id, cl)
+	return s.c.matcher(s.i).AddRegistration(id, cl)
 }
 
-func (f faultyMatcher) RemoveRegistration(id p.ObjectID, cl p.ClientID) error {
-	if f.c.fail() {
+func (s matcherSlot) RemoveRegistration(id p.ObjectID, cl p.ClientID) error {
+	if s.c.fail() {
 		return ErrInjected
 	}
-	return f.m.RemoveRegistration(id, cl)
+	return s.c.matcher(s.i).RemoveRegistration(id, cl)
 }
 
-func (f faultyMatcher) LatestVersion(id p.ObjectID) (p.Version, bool, error) {
-	if f.c.fail() {
+func (s matcherSlot) LatestVersion(id p.ObjectID) (p.Version, bool, error) {
+	if s.c.fail() {
 		return 0, false, ErrInjected
 	}
-	return f.m.LatestVersion(id)
+	return s.c.matcher(s.i).LatestVersion(id)
 }
 
-type faultyRegistrar struct {
+func (s matcherSlot) Epoch() (uint64, error) {
+	if s.c.fail() {
+		return 0, ErrInjected
+	}
+	return s.c.matcher(s.i).Epoch()
+}
+
+type registrarSlot struct {
 	c *Cell
-	r *Registrar
+	i int
 }
 
-func (f faultyRegistrar) Handle(m p.ClientMessage) p.ServerMessage { return f.r.Handle(m) }
-
-func (f faultyRegistrar) Deliver(cl p.ClientID, n p.Notification) error {
-	if f.c.fail() {
+func (s registrarSlot) Deliver(cl p.ClientID, n p.Notification) error {
+	if s.c.fail() {
 		return ErrInjected
 	}
-	return f.r.Deliver(cl, n)
+	return s.c.registrar(s.i).Deliver(cl, n)
 }

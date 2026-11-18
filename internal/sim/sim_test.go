@@ -1,6 +1,6 @@
 // Package sim is Herald's correctness test: a whole cell plus many clients
 // in one process, under message loss, RPC failures, client restarts and
-// total server state loss. It checks the paper's reliable-delivery
+// single-server crashes and total server state loss. It checks the paper's reliable-delivery
 // property (Sec. 5): every well-behaved client eventually learns the
 // latest version of every object it is registered for.
 //
@@ -175,6 +175,14 @@ func run(seed int64) []string {
 				_ = a.c.Tick()
 			}
 		}
+		// Individual server crashes, as separate processes would have.
+		// Both draws happen every round to keep the RNG sequence stable.
+		if r, i := w.rng.Float64(), w.rng.Intn(w.cell.NumMatchers()); r < 0.01 {
+			w.cell.RestartMatcher(i)
+		}
+		if r, i := w.rng.Float64(), w.rng.Intn(w.cell.NumRegistrars()); r < 0.01 {
+			w.cell.RestartRegistrar(i)
+		}
 		w.cell.Step()
 		if round == 150 || round == 300 {
 			w.cell.Wipe() // drop every byte of server state
@@ -205,7 +213,7 @@ func run(seed int64) []string {
 	return violations
 }
 
-var numSeeds = flag.Int("seeds", 20, "number of chaos seeds to run")
+var numSeeds = flag.Int("seeds", 200, "number of chaos seeds to run")
 
 func TestChaos(t *testing.T) {
 	seeds := *numSeeds

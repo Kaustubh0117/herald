@@ -208,7 +208,7 @@ func TestWipeRecoversThroughClient(t *testing.T) {
 
 	// The old token is stale: same client ID, new epoch, empty digest.
 	resp := tc.heartbeat()
-	if resp.NewToken == nil || resp.NewToken.Client != tc.tok.Client || resp.NewToken.Epoch != c.Epoch() {
+	if resp.NewToken == nil || resp.NewToken.Client != tc.tok.Client || resp.NewToken.Epoch == tc.tok.Epoch {
 		t.Fatalf("want a fresh token for the same client, got %+v", resp)
 	}
 	if resp.Digest == p.DigestOf(tc.regs) {
@@ -243,6 +243,47 @@ func TestPreWipeAckDoesNotClearPostWipeUnknown(t *testing.T) {
 	if n, ok := pendingFor(tc.heartbeat(), "products:1"); !ok || !n.Unknown {
 		t.Fatalf("stale ack cleared the post-wipe unknown signal: %+v ok=%v", n, ok)
 	}
+}
+
+func TestMatcherRestartTriggersResync(t *testing.T) {
+	c := NewCell("t", 1, 1, nil)
+	tc := newTestClient(t, c)
+	tc.register("products:1")
+	settle(c)
+	c.Publish("products:1", 4, "")
+	settle(c)
+	tc.ack(wantVersion(t, tc.heartbeat(), "products:1", 4))
+
+	// The Matcher crashes and comes back empty: it no longer knows the
+	// client is registered, and it lost v4.
+	c.RestartMatcher(0)
+	settle(c)
+	n, ok := pendingFor(tc.heartbeat(), "products:1")
+	if !ok || !n.Unknown {
+		t.Fatalf("want an unknown-version signal after the Matcher lost state, got %+v ok=%v", n, ok)
+	}
+	tc.ack(n)
+	c.Publish("products:1", 6, "")
+	settle(c)
+	wantVersion(t, tc.heartbeat(), "products:1", 6) // the registration was re-sent
+}
+
+func TestRegistrarRestartIsAStaleToken(t *testing.T) {
+	c := NewCell("t", 1, 1, nil)
+	tc := newTestClient(t, c)
+	tc.register("products:1")
+	settle(c)
+	c.RestartRegistrar(0)
+	resp := tc.heartbeat()
+	if resp.NewToken == nil || resp.NewToken.Client != tc.tok.Client {
+		t.Fatalf("want a fresh token for the same client, got %+v", resp)
+	}
+	tc.tok = resp.NewToken
+	tc.fullSync()
+	settle(c)
+	c.Publish("products:1", 2, "")
+	settle(c)
+	wantVersion(t, tc.heartbeat(), "products:1", 2)
 }
 
 func TestFastPathPush(t *testing.T) {
@@ -299,7 +340,7 @@ func TestOrderingTrap(t *testing.T) {
 	tc.unregister("products:1")
 	c.Fail = nil
 	settle(c)
-	if st := c.matchers[0].objects["products:1"]; st != nil && st.clients[tc.tok.Client] {
+	if st := c.matcher(0).objects["products:1"]; st != nil && st.clients[tc.tok.Client] {
 		t.Fatal("Matcher kept a registration the client withdrew")
 	}
 }

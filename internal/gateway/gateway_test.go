@@ -17,7 +17,7 @@ import (
 func TestHandshakeRegisterAndFastPath(t *testing.T) {
 	var gw *Gateway
 	cell := server.NewCell("gw", 1, 1, func(_ string, c p.ClientID, ns []p.Notification) { gw.Push(c, ns) })
-	gw = New("gw-test", cell)
+	gw = New("gw-test", Local{cell})
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
 

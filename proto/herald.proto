@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package herald.v1;
+
+option go_package = "github.com/Kaustubh0117/herald/gen/heraldv1";
+
+// ---- Shared types (mirror internal/protocol) ----
+
+message Token {
+  string client_id = 1;
+  string cell = 2;
+  uint64 epoch = 3;
+}
+
+message Notification {
+  string object_id = 1;
+  int64 version = 2;
+  bool unknown = 3;
+  uint64 seq = 4;
+  // Stage timestamps (unix micros) appended as the notification flows
+  // through the system -- used to reproduce the paper's Figure 9 (Phase 10).
+  repeated StageStamp stamps = 5;
+}
+
+message StageStamp {
+  string stage = 1; // "bridge", "matcher", "registrar", "gateway"
+  int64 at_micros = 2;
+}
+
+message ClientMessage {
+  Token token = 1;
+  uint64 nonce = 2;
+  bytes digest = 3; // 32 bytes
+  repeated string register = 4;
+  repeated string unregister = 5;
+  bool full_sync = 6;
+  repeated Notification acks = 7;
+  string gateway_addr = 8;
+}
+
+message ServerMessage {
+  Token new_token = 1;
+  uint64 nonce = 2;
+  bytes digest = 3;
+  bool request_sync = 4;
+  repeated string registered = 5;
+  repeated string unregistered = 6;
+  repeated Notification notifications = 7;
+}
+
+// ---- Gateway -> Registrar, Matcher -> Registrar ----
+
+service Registrar {
+  rpc Handle(ClientMessage) returns (ServerMessage);
+  rpc Deliver(DeliverRequest) returns (DeliverResponse);
+}
+
+message DeliverRequest {
+  message Item {
+    string client_id = 1;
+    Notification notification = 2;
+  }
+  repeated Item items = 1; // batched in Phase 10 (paper: 200 ms window)
+}
+message DeliverResponse {}
+
+// ---- Bridge / Registrar -> Matcher ----
+
+service Matcher {
+  rpc Publish(PublishRequest) returns (PublishResponse);
+  rpc AddRegistration(RegistrationRequest) returns (RegistrationResponse);
+  rpc RemoveRegistration(RegistrationRequest) returns (RegistrationResponse);
+  rpc LatestVersion(LatestVersionRequest) returns (LatestVersionResponse);
+  // Epoch changes whenever the Matcher restarts empty; Registrars watch it
+  // and re-send registrations when it does.
+  rpc Epoch(EpochRequest) returns (EpochResponse);
+}
+
+message PublishRequest {
+  message Item {
+    string object_id = 1;
+    int64 version = 2;
+    string source_client = 3;
+    repeated StageStamp stamps = 4;
+  }
+  repeated Item items = 1; // batched in Phase 10 (paper: up to 500 ms)
+}
+message PublishResponse {}
+
+message RegistrationRequest {
+  string object_id = 1;
+  string client_id = 2;
+}
+message RegistrationResponse {}
+
+message LatestVersionRequest {
+  string object_id = 1;
+}
+message LatestVersionResponse {
+  int64 version = 1;
+  bool known = 2;
+}
+
+message EpochRequest {}
+message EpochResponse {
+  uint64 epoch = 1;
+}
+
+// ---- Registrar -> Gateway (fast path) ----
+
+service Gateway {
+  rpc Push(PushRequest) returns (PushResponse);
+}
+message PushRequest {
+  string client_id = 1;
+  repeated Notification notifications = 2;
+}
+message PushResponse {}

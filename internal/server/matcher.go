@@ -20,20 +20,28 @@ type objState struct {
 // Matcher owns a range of objects: their latest versions and who is
 // registered for them (paper Sec. 4.1, the "object view").
 type Matcher struct {
-	route func(p.ClientID) RegistrarAPI
+	epoch      uint64
+	registrars []RegistrarAPI // routed by protocol.Owner(client)
 
 	mu      sync.Mutex
 	objects map[p.ObjectID]*objState
 	pending map[p.ObjectID]bool // changed objects not yet pushed to every Registrar
 }
 
-func NewMatcher(route func(p.ClientID) RegistrarAPI) *Matcher {
+func NewMatcher(epoch uint64, registrars []RegistrarAPI) *Matcher {
 	return &Matcher{
-		route:   route,
-		objects: map[p.ObjectID]*objState{},
-		pending: map[p.ObjectID]bool{},
+		epoch:      epoch,
+		registrars: registrars,
+		objects:    map[p.ObjectID]*objState{},
+		pending:    map[p.ObjectID]bool{},
 	}
 }
+
+func (m *Matcher) route(c p.ClientID) RegistrarAPI {
+	return m.registrars[p.Owner(string(c), len(m.registrars))]
+}
+
+func (m *Matcher) Epoch() (uint64, error) { return m.epoch, nil }
 
 // obj returns the state for id, creating it if needed. Caller holds m.mu.
 func (m *Matcher) obj(id p.ObjectID) *objState {

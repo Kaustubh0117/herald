@@ -1,0 +1,6 @@
+# Partition map for running every process on this machine (bench/cluster.sh).
+# Servers own equal contiguous slices of the hash space, in list order.
+cell: cell-a
+registrars: ["127.0.0.1:7001", "127.0.0.1:7011"]
+matchers: ["127.0.0.1:7002", "127.0.0.1:7012"]
+step: 50ms

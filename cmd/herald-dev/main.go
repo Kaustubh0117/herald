@@ -8,7 +8,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
@@ -19,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Kaustubh0117/herald/internal/bridge"
+	"github.com/Kaustubh0117/herald/internal/demo"
 	"github.com/Kaustubh0117/herald/internal/gateway"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 	"github.com/Kaustubh0117/herald/internal/server"
@@ -37,7 +37,7 @@ func main() {
 	var gw *gateway.Gateway
 	push := func(_ string, c p.ClientID, ns []p.Notification) { gw.Push(c, ns) }
 	cell := server.NewCell("dev", 2, 2, push)
-	gw = gateway.New("gw-dev", cell)
+	gw = gateway.New("gw-dev", gateway.Local{Cell: cell})
 
 	go func() { // propagator loops
 		for range time.Tick(*step) {
@@ -62,7 +62,7 @@ func main() {
 	// The demo button: throw away every byte of server state.
 	http.HandleFunc("POST /admin/wipe", func(w http.ResponseWriter, r *http.Request) {
 		cell.Wipe()
-		log.Printf("cell wiped: all server state discarded, now epoch %d", cell.Epoch())
+		log.Printf("cell wiped: all server state discarded")
 	})
 
 	if *pg != "" {
@@ -70,12 +70,10 @@ func main() {
 		if err != nil {
 			log.Fatalf("postgres: %v", err)
 		}
-		if err := setupDemo(ctx, db, *slot, *pub); err != nil {
+		if err := demo.Setup(ctx, db, *slot, *pub); err != nil {
 			log.Fatalf("demo setup: %v", err)
 		}
-		http.HandleFunc("GET /api/products", func(w http.ResponseWriter, r *http.Request) {
-			serveProducts(w, r, db)
-		})
+		http.Handle("GET /api/products", demo.Products(db))
 		go runBridge(ctx, &bridge.Bridge{DSN: *pg, Slot: *slot, Publication: *pub, Out: cell})
 	} else {
 		log.Printf("no -pg given: Bridge disabled; use POST /publish to send versions")
@@ -98,61 +96,4 @@ func runBridge(ctx context.Context, b *bridge.Bridge) {
 		log.Printf("bridge stopped: %v (restarting in 1s)", err)
 		time.Sleep(time.Second)
 	}
-}
-
-// setupDemo creates the demo table, publication and slot if missing. This
-// is the application's own database: Herald only reads its WAL.
-func setupDemo(ctx context.Context, db *pgxpool.Pool, slot, pub string) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS products (id int PRIMARY KEY, name text NOT NULL, price int NOT NULL)`,
-		`INSERT INTO products VALUES (1, 'Lamp', 10), (2, 'Desk', 90), (3, 'Chair', 45), (4, 'Shelf', 60)
-		 ON CONFLICT DO NOTHING`,
-	}
-	for _, s := range stmts {
-		if _, err := db.Exec(ctx, s); err != nil {
-			return err
-		}
-	}
-	var exists bool
-	if err := db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`, pub).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		// Identifiers can't be bound as parameters; pub comes from our own flag.
-		if _, err := db.Exec(ctx, `CREATE PUBLICATION `+pub+` FOR TABLE products`); err != nil {
-			return err
-		}
-	}
-	conn, err := db.Acquire(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-	return bridge.EnsureSlot(ctx, conn.Conn(), slot)
-}
-
-type product struct {
-	ID    int    `json:"id"`
-	Name  string `json:"name"`
-	Price int    `json:"price"`
-}
-
-func serveProducts(w http.ResponseWriter, r *http.Request, db *pgxpool.Pool) {
-	rows, err := db.Query(r.Context(), `SELECT id, name, price FROM products ORDER BY id`)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-	out := []product{}
-	for rows.Next() {
-		var pr product
-		if err := rows.Scan(&pr.ID, &pr.Name, &pr.Price); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		out = append(out, pr)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(out)
 }

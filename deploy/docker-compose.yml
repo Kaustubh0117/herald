@@ -1,3 +1,14 @@
+# A Herald cell as separate processes: bridge, matcher, two registrars and a
+# gateway, plus Postgres. From the repo root:
+#   docker compose -f deploy/docker-compose.yml up --build
+#   open http://localhost:8080
+#   docker compose -f deploy/docker-compose.yml kill matcher-0   # restarts empty
+# Every server restarts automatically; correctness must survive it.
+x-herald: &herald
+  build: { context: .., dockerfile: Dockerfile }
+  restart: unless-stopped
+  volumes: ["./partitions.yaml:/etc/herald/partitions.yaml:ro"]
+
 services:
   postgres:
     image: postgres:16
@@ -5,4 +16,35 @@ services:
               "-c", "max_wal_senders=10", "-c", "max_slot_wal_keep_size=2GB"]
     environment: { POSTGRES_PASSWORD: herald }
     ports: ["5432:5432"]
+    volumes: ["./pg-init:/docker-entrypoint-initdb.d:ro"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+      interval: 1s
+      retries: 30
+
+  bridge:
+    <<: *herald
+    command: ["bridge", "-config", "/etc/herald/partitions.yaml", "-demo",
+              "-pg", "postgres://postgres:herald@postgres:5432/postgres", "-slot", "herald_cell_a"]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  matcher-0:
+    <<: *herald
+    command: ["matcher", "-config", "/etc/herald/partitions.yaml", "-i", "0"]
+
+  registrar-0:
+    <<: *herald
+    command: ["registrar", "-config", "/etc/herald/partitions.yaml", "-i", "0"]
+
+  registrar-1:
+    <<: *herald
+    command: ["registrar", "-config", "/etc/herald/partitions.yaml", "-i", "1"]
+
+  gateway:
+    <<: *herald
+    command: ["gateway", "-config", "/etc/herald/partitions.yaml", "-listen", ":8080",
+              "-grpc", "gateway:7100", "-pg", "postgres://postgres:herald@postgres:5432/postgres"]
+    ports: ["8080:8080"]
+    depends_on: { postgres: { condition: service_healthy } }
+
   # add prometheus + grafana here in Phase 10

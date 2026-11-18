@@ -27,6 +27,10 @@ var (
 	// delivering it to some Registrar failed.
 	MatcherDropsFailed = on("matcher-drops-failed")
 
+	// NoMatcherResync: Registrars don't re-send registrations to a Matcher
+	// that restarted empty.
+	NoMatcherResync = on("no-matcher-resync")
+
 	// AckUnregistered: the client acks notifications for objects it is not
 	// (yet) registered for. This was a real bug the simulation found: a
 	// restarted client acked pushes before restoring its intents.

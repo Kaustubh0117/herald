@@ -17,11 +17,14 @@ type MatcherAPI interface {
 	AddRegistration(id p.ObjectID, c p.ClientID) error
 	RemoveRegistration(id p.ObjectID, c p.ClientID) error
 	LatestVersion(id p.ObjectID) (v p.Version, known bool, err error)
+	// Epoch identifies this incarnation; it changes when the Matcher
+	// restarts empty, which tells Registrars to re-send registrations.
+	Epoch() (uint64, error)
 }
 
-// RegistrarAPI is what gateways and Matchers call on a Registrar.
+// RegistrarAPI is what Matchers call on a Registrar. (Clients reach a
+// Registrar's Handle through a gateway, not through this interface.)
 type RegistrarAPI interface {
-	Handle(m p.ClientMessage) p.ServerMessage
 	Deliver(c p.ClientID, n p.Notification) error
 }
 

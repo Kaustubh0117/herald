@@ -22,6 +22,17 @@ psql -d postgres -c "UPDATE products SET price = 12 WHERE id = 1"   # the page u
 (`herald_dev`) in the database named by `PG`. The slot keeps WAL while herald-dev is
 stopped; drop it when you're done: `SELECT pg_drop_replication_slot('herald_dev');`.
 
+### As separate processes
+
+```sh
+bench/cluster.sh   # bridge, 2 matchers, 2 registrars, gateway as local processes;
+                   # kills and restarts each kind, checking a SQL UPDATE still arrives
+docker compose -f deploy/docker-compose.yml up --build    # the same cell in containers
+```
+
+Processes talk over gRPC ([proto/herald.proto](proto/herald.proto)) and find each other
+through a static partition map ([deploy/partitions.yaml](deploy/partitions.yaml)).
+
 ## Correctness
 
 **Property** (paper §5): if a well-behaved client registers for an object, it always
@@ -31,22 +42,23 @@ intermediate versions are allowed.
 **Chaos simulation** ([internal/sim](internal/sim/sim_test.go)): one cell with 3 Registrars,
 3 Matchers and 30 clients watching 20 objects, for 400 rounds. It drops 20% of client
 requests, client replies and fast-path pushes, and fails 10% of internal RPCs. Clients
-restart at random, and **all server state is wiped twice**. After the network heals,
-every client must hold the latest version of everything it wants. 0 violations over
-500 seeds; the default 20 seeds run in under a second and give the same result every
-time for a given seed.
+restart at random, individual Matchers and Registrars crash and come back empty, and
+**all server state is wiped twice**. After the network heals, every client must hold
+the latest version of everything it wants. The default 200 seeds run in under a second
+with 0 violations, and a given seed always gives the same result.
 
 **Mutation testing** ([bench/mutate.sh](bench/mutate.sh)) shows the test can fail: each
 row turns off one mechanism.
 
-| Mechanism removed | Violations (20 seeds) | What it shows |
+| Mechanism removed | Violations (200 seeds) | What it shows |
 |---|---:|---|
 | none | 0 | baseline |
-| Registrar post-propagation | 99 | clients that register after the last change never learn it |
-| Registration sync (full resend on new token / digest mismatch) | 2,903 | after a wipe, servers never relearn registrations |
-| Retransmission of unacked notifications | 101 | the fast path alone loses updates |
-| Matcher keeps failed deliveries pending | 239 | internal RPC failures silently drop updates |
-| Client acks only registered objects | 4 | a real bug the simulation found: a restarted client acked pushes before restoring its registrations |
+| Registrar post-propagation | 1,874 | clients that register after the last change never learn it |
+| Registration sync (full resend on new token / digest mismatch) | 29,114 | after a wipe, servers never relearn registrations |
+| Retransmission of unacked notifications | 890 | the fast path alone loses updates |
+| Matcher keeps failed deliveries pending | 2,149 | internal RPC failures silently drop updates |
+| Registrars re-send registrations to a restarted Matcher | 4,869 | a Matcher that crashes forgets who is registered |
+| Client acks only registered objects | 15 | a real bug the simulation found: a restarted client acked pushes before restoring its registrations |
 
 ## Develop
 

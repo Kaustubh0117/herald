@@ -40,7 +40,7 @@ func TestBrowserClientInterop(t *testing.T) {
 	cell := &countingCell{Cell: server.NewCell("js", 2, 2, func(_ string, c p.ClientID, ns []p.Notification) {
 		gw.Push(c, ns)
 	})}
-	gw = New("gw-js", cell)
+	gw = New("gw-js", Local{cell})
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
 

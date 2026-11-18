@@ -1,6 +1,8 @@
 package server
 
 import (
+	"fmt"
+	"hash/fnv"
 	"maps"
 	"slices"
 	"sync"
@@ -31,39 +33,47 @@ type regOp struct {
 // Registrar owns a range of clients: their registrations and unacked
 // notifications (paper Sec. 4.1, the "client view").
 type Registrar struct {
-	cell  string
-	epoch uint64
-	route func(p.ObjectID) MatcherAPI
-	push  PushFunc
+	cell     string
+	epoch    uint64
+	matchers []MatcherAPI // routed by protocol.Owner(object)
+	push     PushFunc
 
-	mu      sync.Mutex
-	clients map[p.ClientID]*clientState
-	ops     []regOp
+	mu           sync.Mutex
+	clients      map[p.ClientID]*clientState
+	ops          []regOp
+	matcherEpoch []uint64 // last epoch seen per Matcher; 0 = not seen yet
 }
 
-func NewRegistrar(cell string, epoch uint64, route func(p.ObjectID) MatcherAPI, push PushFunc) *Registrar {
+func NewRegistrar(cell string, epoch uint64, matchers []MatcherAPI, push PushFunc) *Registrar {
 	return &Registrar{
-		cell:    cell,
-		epoch:   epoch,
-		route:   route,
-		push:    push,
-		clients: map[p.ClientID]*clientState{},
+		cell:         cell,
+		epoch:        epoch,
+		matchers:     matchers,
+		push:         push,
+		clients:      map[p.ClientID]*clientState{},
+		matcherEpoch: make([]uint64, len(matchers)),
 	}
+}
+
+func (r *Registrar) route(id p.ObjectID) MatcherAPI {
+	return r.matchers[p.Owner(string(id), len(r.matchers))]
 }
 
 // state returns the client's state, creating it if needed. Caller holds r.mu.
 //
-// seq starts at epoch<<32 so unknown-version sequence numbers keep growing
-// across wipes. Otherwise a delayed ack for a pre-wipe "unknown, seq 3"
-// would cover (and silently clear) a post-wipe "unknown, seq 1" that the
-// client has never seen.
+// seq starts at a hash of (epoch, client), so a new incarnation's
+// unknown-version notifications don't reuse an old one's numbers.
+// Otherwise a delayed ack for a pre-wipe "unknown, seq 1" would cover (and
+// silently clear) a post-wipe "unknown, seq 1" the client never saw. The
+// hash is cut to 52 bits so it survives a round trip through a JavaScript
+// number.
 func (r *Registrar) state(c p.ClientID) *clientState {
 	st, ok := r.clients[c]
 	if !ok {
 		st = &clientState{
 			regs:    map[p.ObjectID]bool{},
 			pending: map[p.ObjectID]p.Notification{},
-			seq:     r.epoch << 32,
+			seq:     seqBase(r.epoch, c),
 		}
 		r.clients[c] = st
 	}
@@ -88,11 +98,17 @@ func (r *Registrar) apply(c p.ClientID, st *clientState, id p.ObjectID, add bool
 	r.ops = append(r.ops, regOp{c, id, add})
 }
 
+func seqBase(epoch uint64, c p.ClientID) uint64 {
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%d/%s", epoch, c)
+	return h.Sum64() >> 12
+}
+
 // covers reports whether an ack from the client covers the pending
 // notification cur, i.e. the client has seen cur or something newer.
 func covers(a, cur p.Notification) bool {
-	if cur.Unknown {
-		return a.Unknown && a.Seq >= cur.Seq
+	if cur.Unknown { // seqs aren't ordered across incarnations, so match exactly
+		return a.Unknown && a.Seq == cur.Seq
 	}
 	return !a.Unknown && a.Version >= cur.Version
 }
@@ -200,9 +216,36 @@ func (r *Registrar) Deliver(c p.ClientID, n p.Notification) error {
 	return nil
 }
 
+// checkMatchers re-sends registrations to any Matcher that restarted since
+// we last looked: it came back empty and no longer knows who is registered
+// for its objects. Post-propagation then gives each client the version the
+// new Matcher has, or an unknown-version signal for the ones it lost.
+func (r *Registrar) checkMatchers() {
+	for i, m := range r.matchers {
+		e, err := m.Epoch()
+		if err != nil {
+			continue // unreachable now; we'll notice a restart next pass
+		}
+		r.mu.Lock()
+		old := r.matcherEpoch[i]
+		r.matcherEpoch[i] = e
+		if old != 0 && old != e && !mutate.NoMatcherResync {
+			for _, c := range slices.Sorted(maps.Keys(r.clients)) {
+				for _, id := range slices.Sorted(maps.Keys(r.clients[c].regs)) {
+					if p.Owner(string(id), len(r.matchers)) == i {
+						r.ops = append(r.ops, regOp{c, id, true})
+					}
+				}
+			}
+		}
+		r.mu.Unlock()
+	}
+}
+
 // Propagate is the Registrar Propagator plus "post-propagation"
 // (paper Fig. 4, steps 3-5). Failed ops stay queued and are retried.
 func (r *Registrar) Propagate() {
+	r.checkMatchers()
 	r.mu.Lock()
 	ops := r.ops
 	r.ops = nil

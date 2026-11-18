@@ -25,10 +25,23 @@ type Frame struct {
 	Push []p.Notification `json:",omitempty"`
 }
 
-// Handler is the gateway's view of a cell (server.Cell satisfies it).
+// Handler is the gateway's view of a cell: in-process (Local) or the
+// client's Registrar over gRPC (rpc.Router). On error the gateway closes the
+// socket rather than reply: an empty reply would look like success and make
+// the client drop its queued operations. A closed socket is a lost request,
+// which the client simply retries.
 type Handler interface {
-	Handle(m p.ClientMessage) p.ServerMessage
+	Handle(m p.ClientMessage) (p.ServerMessage, error)
 }
+
+// Local adapts an in-process cell, which can't fail, to Handler.
+type Local struct {
+	Cell interface {
+		Handle(m p.ClientMessage) p.ServerMessage
+	}
+}
+
+func (l Local) Handle(m p.ClientMessage) (p.ServerMessage, error) { return l.Cell.Handle(m), nil }
 
 type Gateway struct {
 	Addr string
@@ -65,7 +78,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.Msg.Addr = g.Addr
-		resp := g.Cell.Handle(*f.Msg)
+		resp, err := g.Cell.Handle(*f.Msg)
+		if err != nil {
+			return
+		}
 		if t := resp.NewToken; t != nil {
 			me = t.Client
 		} else if f.Msg.Token != nil {
@@ -77,7 +93,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			g.mu.Unlock()
 		}
 		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := wsjson.Write(wctx, c, Frame{Resp: &resp})
+		err = wsjson.Write(wctx, c, Frame{Resp: &resp})
 		cancel()
 		if err != nil {
 			return
