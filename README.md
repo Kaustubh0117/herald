@@ -27,7 +27,9 @@ stopped; drop it when you're done: `SELECT pg_drop_replication_slot('herald_dev'
 ```sh
 bench/cluster.sh   # bridge, 2 matchers, 2 registrars, gateway as local processes;
                    # kills and restarts each kind, checking a SQL UPDATE still arrives
-docker compose -f deploy/docker-compose.yml up --build    # the same cell in containers
+docker compose -f deploy/docker-compose.yml up --build -d # the same cell in containers:
+                   # demo on :8080, its Postgres on host port 5433
+bench/compose-check.sh   # crashes each container in turn, checking an UPDATE still arrives
 ```
 
 Processes talk over gRPC ([proto/herald.proto](proto/herald.proto)) and find each other

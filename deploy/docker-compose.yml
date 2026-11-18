@@ -15,7 +15,7 @@ services:
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10",
               "-c", "max_wal_senders=10", "-c", "max_slot_wal_keep_size=2GB"]
     environment: { POSTGRES_PASSWORD: herald }
-    ports: ["5432:5432"]
+    ports: ["5433:5432"] # 5433 on the host: a local Postgres may already own 5432
     volumes: ["./pg-init:/docker-entrypoint-initdb.d:ro"]
     healthcheck:
       test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
