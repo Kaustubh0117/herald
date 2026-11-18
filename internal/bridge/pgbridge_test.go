@@ -108,7 +108,9 @@ func setup(t *testing.T, table, columns string) (db *pgx.Conn, dsn, name string)
 	return db, dsn, name
 }
 
-// start runs a Bridge in the background; stop cancels it and waits.
+// start runs a Bridge in the background; stop cancels it and waits. stop
+// also runs at cleanup (before the slot is dropped), so a test that fails
+// half way never leaves the Bridge running past its end.
 func start(t *testing.T, b *Bridge) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -118,7 +120,9 @@ func start(t *testing.T, b *Bridge) (stop func()) {
 			t.Errorf("bridge: %v", err)
 		}
 	}()
-	return func() { cancel(); <-done }
+	stop = sync.OnceFunc(func() { cancel(); <-done })
+	t.Cleanup(stop)
+	return stop
 }
 
 func TestBridgeAgainstPostgres(t *testing.T) {
@@ -143,16 +147,14 @@ func TestBridgeAgainstPostgres(t *testing.T) {
 	exec(`UPDATE ` + tbl + ` SET price = 12 WHERE id = 1`)
 	exec(`DELETE FROM ` + tbl + ` WHERE id = 2`)
 
-	waitFor(t, func() bool { return len(rec.latest()) == 3 })
-	l := rec.latest()
-	if !(l["products:1"] > 0 && l["products:2"] > 0 && l["products:*"] > 0) {
+	// The INSERT alone produces all three objects, so wait for the DELETE's
+	// commit: it must order after the UPDATE and be the table's latest.
+	waitFor(t, func() bool {
+		l := rec.latest()
+		return l["products:2"] > l["products:1"] && l["products:*"] == l["products:2"]
+	})
+	if l := rec.latest(); len(l) != 3 || l["products:1"] == 0 {
 		t.Fatalf("unexpected objects: %v", l)
-	}
-	if l["products:2"] <= l["products:1"] { // delete committed after the update
-		t.Fatalf("versions not ordered by commit: %v", l)
-	}
-	if l["products:*"] != l["products:2"] {
-		t.Fatalf("table object should carry the latest commit: %v", l)
 	}
 
 	// Crash the bridge, write while it is down, restart: nothing is lost.
@@ -210,7 +212,7 @@ func TestEndToEnd(t *testing.T) {
 
 	l := &notifyLog{}
 	c := client.New(client.Config{
-		Send:     func(m p.ClientMessage) (p.ServerMessage, error) { return cell.Handle(m), nil },
+		Send:     cell.Handle,
 		Listener: l,
 	})
 	c.Register("products:1")

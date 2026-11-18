@@ -9,7 +9,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/Kaustubh0117/herald/gen/heraldv1"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
@@ -100,6 +102,9 @@ func (r *RegistrarClient) Deliver(c p.ClientID, n p.Notification) error {
 	_, err := r.c.Deliver(ctx, &pb.DeliverRequest{Items: []*pb.DeliverRequest_Item{
 		{ClientId: string(c), Notification: notifToPB(n)},
 	}})
+	if status.Code(err) == codes.NotFound {
+		return server.ErrNotRegistered
+	}
 	return err
 }
 

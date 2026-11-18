@@ -9,16 +9,22 @@
 package sim
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"maps"
 	"math/rand"
+	"os"
 	"slices"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Kaustubh0117/herald/internal/client"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 	"github.com/Kaustubh0117/herald/internal/server"
+	pgstore "github.com/Kaustubh0117/herald/internal/store"
 )
 
 const (
@@ -26,8 +32,10 @@ const (
 	numObjects = 20
 	wantsEach  = 5
 	numRounds  = 400
-	loss       = 0.2 // client<->cell requests, replies, and fast-path pushes
-	rpcFail    = 0.1 // calls between Matchers, Registrars and the Bridge
+	loss       = 0.2             // client<->cell requests, replies, and fast-path pushes
+	rpcFail    = 0.1             // calls between Matchers, Registrars and the Bridge
+	storeFail  = 0.05            // persist mode: store writes that fail
+	gcTTL      = 8 * time.Second // idle clients collected after 8 rounds
 )
 
 // store is the fake application database. Herald never sees its values,
@@ -83,7 +91,10 @@ func (w *world) send(m p.ClientMessage) (p.ServerMessage, error) {
 	if w.rng.Float64() < w.loss {
 		return p.ServerMessage{}, fmt.Errorf("request lost")
 	}
-	resp := w.cell.Handle(m)
+	resp, err := w.cell.Handle(m)
+	if err != nil {
+		return p.ServerMessage{}, err // a failed store write: the client retries
+	}
 	if w.rng.Float64() < w.loss {
 		return p.ServerMessage{}, fmt.Errorf("reply lost")
 	}
@@ -106,15 +117,36 @@ func (w *world) start(a *app) {
 }
 
 // run plays one seeded scenario and returns every property violation.
-func run(seed int64) []string {
+// run plays one seeded scenario and returns every property violation.
+// With a store, servers persist their state, restarted servers reload it,
+// and Wipe clears it; a MemStore additionally fails 5% of writes.
+func run(seed int64, st server.Store) []string {
 	w := &world{
 		rng:    rand.New(rand.NewSource(seed)),
 		loss:   loss,
 		store:  &store{v: map[p.ObjectID]p.Version{}},
 		byAddr: map[string]*app{},
 	}
-	w.cell = server.NewCell("sim", 3, 3, w.push)
+	ms, _ := st.(*server.MemStore)
+	if ms != nil {
+		ms.Fail = func() bool { return w.rng.Float64() < storeFail }
+	}
+	if st != nil {
+		if _, err := st.Wipe(); err != nil { // start from empty state
+			return []string{"wipe: " + err.Error()}
+		}
+		var err error
+		if w.cell, err = server.NewCellWithStore("sim", 3, 3, w.push, st); err != nil {
+			return []string{"start: " + err.Error()}
+		}
+	} else {
+		w.cell = server.NewCell("sim", 3, 3, w.push)
+	}
 	w.cell.Fail = func() bool { return w.rng.Float64() < rpcFail }
+	// A simulated clock, one second per round, so idle clients get garbage
+	// collected and come back as zombies with a fresh ID (paper Sec. 4.2.4).
+	clock := time.Unix(0, 0)
+	w.cell.SetClock(func() time.Time { return clock })
 
 	objs := make([]p.ObjectID, numObjects)
 	for i := range objs {
@@ -149,6 +181,10 @@ func run(seed int64) []string {
 	}
 
 	for round := 0; round < numRounds; round++ {
+		clock = clock.Add(time.Second)
+		if round%10 == 0 {
+			_ = w.cell.GC(gcTTL) // a failed store write just leaves the client for next time
+		}
 		if w.rng.Float64() < 0.5 { // an application write commits
 			id := objs[w.rng.Intn(len(objs))]
 			backlog = append(backlog, p.Notification{Object: id, Version: w.store.Bump(id)})
@@ -192,6 +228,9 @@ func run(seed int64) []string {
 	// Quiesce: heal the network and let the system converge.
 	w.loss = 0
 	w.cell.Fail = nil
+	if ms != nil {
+		ms.Fail = nil
+	}
 	for i := 0; i < 10; i++ {
 		publishBacklog()
 		for _, a := range w.apps {
@@ -220,24 +259,59 @@ func TestChaos(t *testing.T) {
 	if testing.Short() {
 		seeds = 5
 	}
-	total := 0
-	for s := int64(1); s <= int64(seeds); s++ {
-		v := run(s)
-		total += len(v)
-		for i, msg := range v {
-			if i == 3 {
-				t.Errorf("seed %d: ... and %d more", s, len(v)-3)
-				break
+	total, byMode := 0, map[string]int{}
+	for _, persist := range []bool{false, true} {
+		mode := map[bool]string{false: "memory", true: "store"}[persist]
+		for s := int64(1); s <= int64(seeds); s++ {
+			var st server.Store
+			if persist {
+				st = server.NewMemStore()
 			}
-			t.Errorf("seed %d: %s", s, msg)
+			v := run(s, st)
+			total += len(v)
+			byMode[mode] += len(v)
+			for i, msg := range v {
+				if i == 3 {
+					t.Errorf("%s seed %d: ... and %d more", mode, s, len(v)-3)
+					break
+				}
+				t.Errorf("%s seed %d: %s", mode, s, msg)
+			}
 		}
 	}
 	// bench/mutate.sh greps this line.
-	t.Logf("total violations over %d seeds: %d", seeds, total)
+	t.Logf("total violations over %d seeds: %d (memory %d, store %d)",
+		seeds, total, byMode["memory"], byMode["store"])
 }
 
 func TestChaosIsDeterministic(t *testing.T) {
-	if a, b := fmt.Sprint(run(7)), fmt.Sprint(run(7)); a != b {
+	if a, b := fmt.Sprint(run(7, server.NewMemStore())), fmt.Sprint(run(7, server.NewMemStore())); a != b {
 		t.Fatalf("same seed, different outcome:\n%s\n%s", a, b)
+	}
+}
+
+// TestChaosPostgres runs a few seeds with Postgres underneath every server:
+// restarts reload from real tables, and wipes truncate them.
+func TestChaosPostgres(t *testing.T) {
+	dsn := os.Getenv("HERALD_PG")
+	if dsn == "" {
+		t.Skip("HERALD_PG not set; run `make test-pg`")
+	}
+	ctx := context.Background()
+	db, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	schema := fmt.Sprintf("herald_test_sim_%d_%d", os.Getpid(), time.Now().UnixNano()%1e9)
+	defer db.Exec(ctx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+	st, err := pgstore.Open(ctx, db, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for s := int64(1); s <= 3; s++ {
+		for _, v := range run(s, st) {
+			t.Errorf("postgres seed %d: %s", s, v)
+		}
 	}
 }

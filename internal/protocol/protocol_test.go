@@ -85,3 +85,30 @@ func TestPartitionKey(t *testing.T) {
 		t.Fatal("partition key must be deterministic")
 	}
 }
+
+func TestKeyRangeAgreesWithOwner(t *testing.T) {
+	in := func(k, lo, hi string) bool { return k >= lo && (hi == "" || k < hi) }
+	for _, n := range []int{1, 2, 3, 4, 7} {
+		for i := 0; i < 20000; i++ {
+			id := fmt.Sprintf("client-%d", i)
+			k := PartitionKey(id)
+			for s := 0; s < n; s++ {
+				lo, hi := KeyRange(s, n)
+				if in(k, lo, hi) != (Owner(id, n) == s) {
+					t.Fatalf("n=%d server %d: %s in [%s,%s) disagrees with Owner=%d", n, s, k, lo, hi, Owner(id, n))
+				}
+			}
+		}
+	}
+	// Exact boundaries, where an off-by-one would hide.
+	for _, n := range []int{3, 7} {
+		for s := 1; s < n; s++ {
+			lo, _ := KeyRange(s, n)
+			var h uint64
+			fmt.Sscanf(lo, "%x", &h)
+			if int(h*uint64(n)>>32) != s || int((h-1)*uint64(n)>>32) != s-1 {
+				t.Fatalf("n=%d: boundary %s is off", n, lo)
+			}
+		}
+	}
+}

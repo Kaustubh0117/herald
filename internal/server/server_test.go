@@ -20,8 +20,8 @@ type testClient struct {
 
 func newTestClient(t *testing.T, c *Cell) *testClient {
 	t.Helper()
-	resp := c.Handle(p.ClientMessage{Nonce: 1})
-	if resp.NewToken == nil {
+	resp, err := c.Handle(p.ClientMessage{Nonce: 1})
+	if err != nil || resp.NewToken == nil {
 		t.Fatal("handshake returned no token")
 	}
 	return &testClient{t: t, cell: c, tok: resp.NewToken, regs: map[p.ObjectID]bool{}}
@@ -29,7 +29,11 @@ func newTestClient(t *testing.T, c *Cell) *testClient {
 
 func (tc *testClient) send(m p.ClientMessage) p.ServerMessage {
 	m.Token, m.Digest, m.Addr = tc.tok, p.DigestOf(tc.regs), tc.addr
-	return tc.cell.Handle(m)
+	resp, err := tc.cell.Handle(m)
+	if err != nil {
+		tc.t.Fatalf("handle: %v", err)
+	}
+	return resp
 }
 
 func (tc *testClient) register(ids ...p.ObjectID) p.ServerMessage {
@@ -340,7 +344,7 @@ func TestOrderingTrap(t *testing.T) {
 	tc.unregister("products:1")
 	c.Fail = nil
 	settle(c)
-	if st := c.matcher(0).objects["products:1"]; st != nil && st.clients[tc.tok.Client] {
+	if st := c.matcher(0).objects["products:1"]; st != nil && st.clients[tc.tok.Client] != 0 {
 		t.Fatal("Matcher kept a registration the client withdrew")
 	}
 }

@@ -88,7 +88,7 @@ func (s *countingSend) send(m p.ClientMessage) (p.ServerMessage, error) {
 	if m.FullSync {
 		s.fullSyncs++
 	}
-	return s.cell.Handle(m), nil
+	return s.cell.Handle(m)
 }
 
 func rounds(cell *server.Cell, n int, cs ...*Client) {
@@ -180,7 +180,10 @@ func TestConvergesOverLossyNetwork(t *testing.T) {
 		if rng.Float64() < 0.3 {
 			return p.ServerMessage{}, errors.New("request lost")
 		}
-		resp := cell.Handle(m)
+		resp, err := cell.Handle(m)
+		if err != nil {
+			return p.ServerMessage{}, err
+		}
 		if rng.Float64() < 0.3 { // the nasty case: server applied it, reply lost
 			return p.ServerMessage{}, errors.New("reply lost")
 		}

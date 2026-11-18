@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"hash/fnv"
 )
 
@@ -91,4 +92,18 @@ func PartitionKey(id string) string {
 // into n contiguous ranges -- the paper's static range partitioning.
 func Owner(id string, n int) int {
 	return int(uint64(hash32(id)) * uint64(n) >> 32)
+}
+
+// KeyRange returns the PartitionKey range owned by server i of n, for a
+// recovery scan: keys k with lo <= k < hi, where hi == "" means no upper
+// bound. It agrees exactly with Owner: Owner(id, n) == i iff
+// PartitionKey(id) falls in KeyRange(i, n).
+func KeyRange(i, n int) (lo, hi string) {
+	// Owner(h) = floor(h*n / 2^32) == i  <=>  ceil(i*2^32/n) <= h < ceil((i+1)*2^32/n)
+	bound := func(j int) uint64 { return (uint64(j)<<32 + uint64(n) - 1) / uint64(n) }
+	lo = fmt.Sprintf("%08x", bound(i))
+	if i+1 < n {
+		hi = fmt.Sprintf("%08x", bound(i+1))
+	}
+	return lo, hi
 }

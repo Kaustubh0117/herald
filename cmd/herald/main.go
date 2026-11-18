@@ -5,6 +5,10 @@
 //	herald registrar -config partitions.yaml -i 0
 //	herald gateway   -config partitions.yaml -listen :8080 -grpc 127.0.0.1:7100 [-pg URL]
 //	herald bridge    -config partitions.yaml -pg URL [-demo]
+//	herald wipe      -config partitions.yaml -pg URL
+//
+// With -store, matchers and registrars keep their soft state in Postgres
+// (-pg) and reload it when restarted, instead of making clients re-sync.
 //
 // For a single process running everything, use herald-dev instead.
 package main
@@ -31,6 +35,7 @@ import (
 	"github.com/Kaustubh0117/herald/internal/gateway"
 	"github.com/Kaustubh0117/herald/internal/rpc"
 	"github.com/Kaustubh0117/herald/internal/server"
+	"github.com/Kaustubh0117/herald/internal/store"
 	"github.com/Kaustubh0117/herald/web"
 )
 
@@ -46,7 +51,7 @@ type Config struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: herald matcher|registrar|gateway|bridge [flags]")
+		fmt.Fprintln(os.Stderr, "usage: herald matcher|registrar|gateway|bridge|wipe [flags]")
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
@@ -59,6 +64,8 @@ func main() {
 	slot := fs.String("slot", "herald_cell", "bridge: replication slot")
 	pub := fs.String("pub", "herald_pub", "bridge: publication")
 	demoSetup := fs.Bool("demo", false, "bridge: create the demo table, publication and slot if missing")
+	persist := fs.Bool("store", false, "matcher/registrar: keep soft state in Postgres (-pg) and reload it on restart")
+	gcTTL := fs.Duration("gc-ttl", 24*time.Hour, "registrar: garbage-collect clients idle this long")
 	fs.Parse(args)
 
 	cfg, err := loadConfig(*configPath)
@@ -69,11 +76,25 @@ func main() {
 	defer stop()
 	log.SetPrefix(fmt.Sprintf("[%s] ", cmd))
 
+	var st server.Store
+	if *persist || cmd == "wipe" {
+		if *pg == "" {
+			log.Fatal("-store and wipe need -pg or HERALD_PG")
+		}
+		st = openStore(ctx, *pg, cfg.Cell)
+	}
+
 	switch cmd {
 	case "matcher":
-		runMatcher(ctx, cfg, *index)
+		runMatcher(ctx, cfg, *index, st)
 	case "registrar":
-		runRegistrar(ctx, cfg, *index)
+		runRegistrar(ctx, cfg, *index, st, *gcTTL)
+	case "wipe":
+		e, err := st.Wipe()
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("wiped cell %s; new epoch %d. Restart its matchers and registrars.", cfg.Cell, e)
 	case "gateway":
 		runGateway(ctx, cfg, *listen, *grpcAddr, *pg)
 	case "bridge":
@@ -122,8 +143,9 @@ func registrarClients(cfg *Config) []*rpc.RegistrarClient {
 	return out
 }
 
-// epoch identifies this process incarnation. Restarting it empty must
-// produce a new value, which millisecond start time does.
+// epoch identifies the state a memory-only process starts with: empty, so
+// it must differ from any previous run, which millisecond start time does.
+// (With -store the epoch comes from the store and survives restarts.)
 func epoch() uint64 { return uint64(time.Now().UnixMilli()) }
 
 // serveGRPC listens on the port of addr on all interfaces: addr is how
@@ -159,19 +181,58 @@ func every(ctx context.Context, d time.Duration, f func()) {
 	}
 }
 
-func runMatcher(ctx context.Context, cfg *Config, i int) {
+// openStore opens the cell's state schema ("herald_<cell>").
+func openStore(ctx context.Context, pg, cell string) server.Store {
+	db, err := pgxpool.New(ctx, pg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	st, err := store.Open(ctx, db, "herald_"+cell)
+	if err != nil {
+		log.Fatalf("store: %v", err)
+	}
+	return st
+}
+
+func runMatcher(ctx context.Context, cfg *Config, i int, st server.Store) {
 	var regs []server.RegistrarAPI
 	for _, r := range registrarClients(cfg) {
 		regs = append(regs, r)
 	}
 	m := server.NewMatcher(epoch(), regs)
+	if st != nil {
+		e, err := st.Epoch()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if m, err = server.LoadMatcher(e, regs, st, i, len(cfg.Matchers)); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("loaded state from Postgres (epoch %d)", e)
+	}
 	go every(ctx, cfg.Step, m.Propagate)
 	serveGRPC(ctx, cfg.Matchers[i], func(s *grpc.Server) { pb.RegisterMatcherServer(s, &rpc.MatcherServer{M: m}) })
 }
 
-func runRegistrar(ctx context.Context, cfg *Config, i int) {
-	r := server.NewRegistrar(cfg.Cell, epoch(), matcherClients(cfg), rpc.NewPusher().Push)
+func runRegistrar(ctx context.Context, cfg *Config, i int, st server.Store, gcTTL time.Duration) {
+	push := rpc.NewPusher().Push
+	r := server.NewRegistrar(cfg.Cell, epoch(), matcherClients(cfg), push)
+	if st != nil {
+		e, err := st.Epoch()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if r, err = server.LoadRegistrar(cfg.Cell, e, matcherClients(cfg), push, st, i, len(cfg.Registrars), nil); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("loaded state from Postgres (epoch %d)", e)
+	}
 	go every(ctx, cfg.Step, r.Propagate)
+	go every(ctx, time.Minute, func() {
+		if err := r.GC(gcTTL); err != nil {
+			log.Printf("gc: %v", err) // retried next minute
+		}
+	})
 	serveGRPC(ctx, cfg.Registrars[i], func(s *grpc.Server) { pb.RegisterRegistrarServer(s, &rpc.RegistrarServer{R: r}) })
 }
 

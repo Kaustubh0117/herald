@@ -25,7 +25,7 @@ type Frame struct {
 	Push []p.Notification `json:",omitempty"`
 }
 
-// Handler is the gateway's view of a cell: in-process (Local) or the
+// Handler is the gateway's view of a cell: in-process (server.Cell) or the
 // client's Registrar over gRPC (rpc.Router). On error the gateway closes the
 // socket rather than reply: an empty reply would look like success and make
 // the client drop its queued operations. A closed socket is a lost request,
@@ -33,15 +33,6 @@ type Frame struct {
 type Handler interface {
 	Handle(m p.ClientMessage) (p.ServerMessage, error)
 }
-
-// Local adapts an in-process cell, which can't fail, to Handler.
-type Local struct {
-	Cell interface {
-		Handle(m p.ClientMessage) p.ServerMessage
-	}
-}
-
-func (l Local) Handle(m p.ClientMessage) (p.ServerMessage, error) { return l.Cell.Handle(m), nil }
 
 type Gateway struct {
 	Addr string

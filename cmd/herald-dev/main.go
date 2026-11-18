@@ -22,6 +22,7 @@ import (
 	"github.com/Kaustubh0117/herald/internal/gateway"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 	"github.com/Kaustubh0117/herald/internal/server"
+	"github.com/Kaustubh0117/herald/internal/store"
 	"github.com/Kaustubh0117/herald/web"
 )
 
@@ -31,17 +32,43 @@ func main() {
 	slot := flag.String("slot", "herald_dev", "replication slot (created if missing)")
 	pub := flag.String("pub", "herald_pub", "publication (created for the demo table if missing)")
 	step := flag.Duration("step", 50*time.Millisecond, "propagator interval (the paper batches with ~200-500 ms)")
+	persist := flag.Bool("store", false, "keep Herald's soft state in Postgres (schema herald_dev) and reload it on restart")
+	gcTTL := flag.Duration("gc-ttl", 24*time.Hour, "garbage-collect clients idle this long")
 	flag.Parse()
 	ctx := context.Background()
 
 	var gw *gateway.Gateway
 	push := func(_ string, c p.ClientID, ns []p.Notification) { gw.Push(c, ns) }
 	cell := server.NewCell("dev", 2, 2, push)
-	gw = gateway.New("gw-dev", gateway.Local{Cell: cell})
+	if *persist {
+		if *pg == "" {
+			log.Fatal("-store needs -pg")
+		}
+		db, err := pgxpool.New(ctx, *pg)
+		if err != nil {
+			log.Fatal(err)
+		}
+		st, err := store.Open(ctx, db, "herald_dev")
+		if err != nil {
+			log.Fatalf("store: %v", err)
+		}
+		if cell, err = server.NewCellWithStore("dev", 2, 2, push, st); err != nil {
+			log.Fatalf("loading state: %v", err)
+		}
+		log.Printf("soft state in Postgres schema herald_dev: restarts reload it, Wipe truncates it")
+	}
+	gw = gateway.New("gw-dev", cell)
 
 	go func() { // propagator loops
 		for range time.Tick(*step) {
 			cell.Step()
+		}
+	}()
+	go func() {
+		for range time.Tick(time.Minute) {
+			if err := cell.GC(*gcTTL); err != nil {
+				log.Printf("gc: %v", err)
+			}
 		}
 	}()
 
@@ -61,7 +88,10 @@ func main() {
 
 	// The demo button: throw away every byte of server state.
 	http.HandleFunc("POST /admin/wipe", func(w http.ResponseWriter, r *http.Request) {
-		cell.Wipe()
+		if err := cell.Wipe(); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		log.Printf("cell wiped: all server state discarded")
 	})
 

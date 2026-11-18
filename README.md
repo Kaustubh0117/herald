@@ -44,23 +44,40 @@ intermediate versions are allowed.
 **Chaos simulation** ([internal/sim](internal/sim/sim_test.go)): one cell with 3 Registrars,
 3 Matchers and 30 clients watching 20 objects, for 400 rounds. It drops 20% of client
 requests, client replies and fast-path pushes, and fails 10% of internal RPCs. Clients
-restart at random, individual Matchers and Registrars crash and come back empty, and
-**all server state is wiped twice**. After the network heals, every client must hold
-the latest version of everything it wants. The default 200 seeds run in under a second
-with 0 violations, and a given seed always gives the same result.
+restart at random, individual Matchers and Registrars crash, idle clients are
+garbage-collected and come back as zombies, and **all server state is wiped twice**. Every
+seed runs twice: memory-only (crashed servers come back empty), and with persistent state
+(crashed servers reload it, while 5% of store writes fail). A few seeds also run on real
+Postgres. After the network heals, every client must hold the latest version of everything
+it wants. The default 200 seeds run in about a second with 0 violations, and a given seed
+always gives the same result.
 
 **Mutation testing** ([bench/mutate.sh](bench/mutate.sh)) shows the test can fail: each
 row turns off one mechanism.
 
-| Mechanism removed | Violations (200 seeds) | What it shows |
+| Mechanism removed | Violations (200 seeds × 2 modes) | What it shows |
 |---|---:|---|
 | none | 0 | baseline |
-| Registrar post-propagation | 1,874 | clients that register after the last change never learn it |
-| Registration sync (full resend on new token / digest mismatch) | 29,114 | after a wipe, servers never relearn registrations |
-| Retransmission of unacked notifications | 890 | the fast path alone loses updates |
-| Matcher keeps failed deliveries pending | 2,149 | internal RPC failures silently drop updates |
-| Registrars re-send registrations to a restarted Matcher | 4,869 | a Matcher that crashes forgets who is registered |
-| Client acks only registered objects | 15 | a real bug the simulation found: a restarted client acked pushes before restoring its registrations |
+| Registrar post-propagation | 10,606 | clients that register after the last change never learn it |
+| Registration sync (full resend on new token / digest mismatch) | 58,700 | after a wipe, servers never relearn registrations |
+| Retransmission of unacked notifications | 2,068 | the fast path alone loses updates |
+| Matcher keeps failed deliveries pending | 3,903 | internal RPC failures silently drop updates |
+| Registrars re-send registrations to a restarted Matcher | 1,950 | a memory-only Matcher that crashes forgets who is registered |
+| Write to the store before applying in memory | 12 | a failed write that still updates memory is lost on the next restart |
+| Reloaded Registrar replays unpropagated registrations | 97 | registrations in flight at a crash never reach their Matcher |
+| Client acks only registered objects | 32 | a real bug the simulation found: a restarted client acked pushes before restoring its registrations |
+
+## Persistent soft state
+
+With `-store`, Matchers and Registrars keep their state in Postgres (schema `herald_<cell>`,
+tables mirroring paper Table 2; see [internal/store/schema.sql](internal/store/schema.sql)).
+Every change is written before it is applied or acknowledged, as one idempotent upsert. A
+restarted server reloads its own key range with one range scan: in
+`TestRegistrarRestartCausesNoResyncs`, a Registrar holding 10,000 clients restarts in
+about 11 ms and none of its clients has to re-sync. Clients idle longer than `-gc-ttl` are
+garbage-collected; if one returns, it gets a fresh ID and re-registers (paper §4.2.4).
+`herald wipe` truncates the cell's state and moves its epoch forward. Correctness never
+depends on the store: wiping it only costs a round of re-syncs.
 
 ## Develop
 

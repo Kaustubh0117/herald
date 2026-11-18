@@ -2,6 +2,10 @@ package rpc
 
 import (
 	"context"
+	"errors"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/Kaustubh0117/herald/gen/heraldv1"
 	"github.com/Kaustubh0117/herald/internal/gateway"
@@ -49,12 +53,20 @@ type RegistrarServer struct {
 }
 
 func (s *RegistrarServer) Handle(_ context.Context, m *pb.ClientMessage) (*pb.ServerMessage, error) {
-	return serverMessageToPB(s.R.Handle(clientMessageFromPB(m))), nil
+	resp, err := s.R.Handle(clientMessageFromPB(m))
+	if err != nil {
+		return nil, err
+	}
+	return serverMessageToPB(resp), nil
 }
 
 func (s *RegistrarServer) Deliver(_ context.Context, req *pb.DeliverRequest) (*pb.DeliverResponse, error) {
 	for _, it := range req.Items {
-		if err := s.R.Deliver(p.ClientID(it.ClientId), notifFromPB(it.Notification)); err != nil {
+		err := s.R.Deliver(p.ClientID(it.ClientId), notifFromPB(it.Notification))
+		if errors.Is(err, server.ErrNotRegistered) {
+			return nil, status.Error(codes.NotFound, err.Error()) // the Matcher drops the registration
+		}
+		if err != nil {
 			return nil, err
 		}
 	}

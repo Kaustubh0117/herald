@@ -21,7 +21,7 @@ type countingCell struct {
 	fullSyncs atomic.Int32
 }
 
-func (c *countingCell) Handle(m p.ClientMessage) p.ServerMessage {
+func (c *countingCell) Handle(m p.ClientMessage) (p.ServerMessage, error) {
 	if m.FullSync {
 		c.fullSyncs.Add(1)
 	}
@@ -40,7 +40,7 @@ func TestBrowserClientInterop(t *testing.T) {
 	cell := &countingCell{Cell: server.NewCell("js", 2, 2, func(_ string, c p.ClientID, ns []p.Notification) {
 		gw.Push(c, ns)
 	})}
-	gw = New("gw-js", Local{cell})
+	gw = New("gw-js", cell)
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
 

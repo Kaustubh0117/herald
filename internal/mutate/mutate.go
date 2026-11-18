@@ -31,6 +31,14 @@ var (
 	// that restarted empty.
 	NoMatcherResync = on("no-matcher-resync")
 
+	// MemoryBeforeStore: a server applies a change in memory even when
+	// writing it to the store failed, so a restart reloads stale state.
+	MemoryBeforeStore = on("memory-before-store")
+
+	// NoReplayPending: a reloaded Registrar forgets registration changes
+	// that hadn't reached their Matcher yet.
+	NoReplayPending = on("no-replay-pending")
+
 	// AckUnregistered: the client acks notifications for objects it is not
 	// (yet) registered for. This was a real bug the simulation found: a
 	// restarted client acked pushes before restoring its intents.

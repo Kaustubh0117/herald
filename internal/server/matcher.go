@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"maps"
 	"slices"
 	"sync"
@@ -14,7 +15,10 @@ type objState struct {
 	version p.Version
 	known   bool       // false until the first publish (or after a wipe)
 	source  p.ClientID // the writer, which is not notified of its own change
-	clients map[p.ClientID]bool
+	// clients maps each registered client to a generation number that
+	// changes on every AddRegistration, so dropping a stale registration
+	// never removes one that was re-added meanwhile.
+	clients map[p.ClientID]uint64
 }
 
 // Matcher owns a range of objects: their latest versions and who is
@@ -22,8 +26,10 @@ type objState struct {
 type Matcher struct {
 	epoch      uint64
 	registrars []RegistrarAPI // routed by protocol.Owner(client)
+	store      MatcherStore   // nil: memory only
 
 	mu      sync.Mutex
+	gen     uint64
 	objects map[p.ObjectID]*objState
 	pending map[p.ObjectID]bool // changed objects not yet pushed to every Registrar
 }
@@ -37,6 +43,29 @@ func NewMatcher(epoch uint64, registrars []RegistrarAPI) *Matcher {
 	}
 }
 
+// LoadMatcher starts Matcher i of n from its key range in the store and
+// resumes propagating whatever was still pending (paper Sec. 4.2.5).
+func LoadMatcher(epoch uint64, registrars []RegistrarAPI, st MatcherStore, i, n int) (*Matcher, error) {
+	m := NewMatcher(epoch, registrars)
+	m.store = st
+	rows, err := st.LoadMatcher(i, n)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		o := m.obj(row.ID)
+		o.version, o.known, o.source = row.Version, row.Known, row.Source
+		for _, c := range row.Clients {
+			m.gen++
+			o.clients[c] = m.gen
+		}
+		if row.Pending {
+			m.pending[row.ID] = true
+		}
+	}
+	return m, nil
+}
+
 func (m *Matcher) route(c p.ClientID) RegistrarAPI {
 	return m.registrars[p.Owner(string(c), len(m.registrars))]
 }
@@ -47,7 +76,7 @@ func (m *Matcher) Epoch() (uint64, error) { return m.epoch, nil }
 func (m *Matcher) obj(id p.ObjectID) *objState {
 	st, ok := m.objects[id]
 	if !ok {
-		st = &objState{clients: map[p.ClientID]bool{}}
+		st = &objState{clients: map[p.ClientID]uint64{}}
 		m.objects[id] = st
 	}
 	return st
@@ -62,6 +91,11 @@ func (m *Matcher) Publish(id p.ObjectID, v p.Version, source p.ClientID) error {
 	if st.known && v <= st.version {
 		return nil // duplicate or reordered publish: nothing to do
 	}
+	if m.store != nil {
+		if err := m.store.SaveVersion(id, v, source); err != nil && !mutate.MemoryBeforeStore {
+			return err
+		}
+	}
 	st.version, st.known, st.source = v, true, source
 	m.pending[id] = true
 	return nil
@@ -70,16 +104,35 @@ func (m *Matcher) Publish(id p.ObjectID, v p.Version, source p.ClientID) error {
 func (m *Matcher) AddRegistration(id p.ObjectID, c p.ClientID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.obj(id).clients[c] = true
+	st := m.obj(id)
+	if _, ok := st.clients[c]; !ok && m.store != nil {
+		if err := m.store.SaveMatcherReg(id, c); err != nil {
+			return err
+		}
+	}
+	m.gen++
+	st.clients[c] = m.gen
 	return nil
 }
 
 func (m *Matcher) RemoveRegistration(id p.ObjectID, c p.ClientID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if st, ok := m.objects[id]; ok {
-		delete(st.clients, c)
+	return m.remove(id, c)
+}
+
+// remove drops a registration. Caller holds m.mu.
+func (m *Matcher) remove(id p.ObjectID, c p.ClientID) error {
+	st, ok := m.objects[id]
+	if !ok {
+		return nil
 	}
+	if _, ok := st.clients[c]; ok && m.store != nil {
+		if err := m.store.DeleteMatcherReg(id, c); err != nil {
+			return err
+		}
+	}
+	delete(st.clients, c)
 	return nil
 }
 
@@ -101,7 +154,7 @@ func (m *Matcher) Propagate() {
 		id      p.ObjectID
 		v       p.Version
 		source  p.ClientID
-		clients []p.ClientID
+		clients map[p.ClientID]uint64
 	}
 	// Snapshot under the lock, then call Registrars without holding it, so a
 	// slow Registrar never blocks Publish.
@@ -109,25 +162,39 @@ func (m *Matcher) Propagate() {
 	var jobs []job
 	for _, id := range slices.Sorted(maps.Keys(m.pending)) {
 		st := m.objects[id]
-		jobs = append(jobs, job{id, st.version, st.source, slices.Sorted(maps.Keys(st.clients))})
+		jobs = append(jobs, job{id, st.version, st.source, maps.Clone(st.clients)})
 	}
 	m.mu.Unlock()
 
 	for _, j := range jobs {
 		ok := true
-		for _, c := range j.clients {
+		for _, c := range slices.Sorted(maps.Keys(j.clients)) {
 			if c == j.source {
 				continue // the writer already knows about its own change
 			}
 			n := p.Notification{Object: j.id, Version: j.v}
-			if err := m.route(c).Deliver(c, n); err != nil {
+			err := m.route(c).Deliver(c, n)
+			if errors.Is(err, ErrNotRegistered) {
+				// A stale registration (client collected or gone): drop it,
+				// unless the client registered again while we were calling.
+				m.mu.Lock()
+				if m.objects[j.id].clients[c] == j.clients[c] {
+					err = m.remove(j.id, c)
+				} else {
+					err = nil
+				}
+				m.mu.Unlock()
+			}
+			if err != nil {
 				ok = false // keep it pending; retry on the next pass
 			}
 		}
 		m.mu.Lock()
 		// Only clear if no newer version arrived while we were propagating.
 		if (ok || mutate.MatcherDropsFailed) && m.objects[j.id].version == j.v {
-			delete(m.pending, j.id)
+			if m.store == nil || m.store.ClearPending(j.id, j.v) == nil {
+				delete(m.pending, j.id)
+			}
 		}
 		m.mu.Unlock()
 	}
