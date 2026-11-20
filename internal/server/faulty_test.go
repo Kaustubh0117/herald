@@ -129,3 +129,17 @@ func scratchLen(t *testing.T, st Store) int {
 	}
 	return len(es)
 }
+
+// TestScratchSurvivesCrowding: a long outage parks many objects, and each
+// one occupies a slot until the outage ends. Every publish must still find
+// room, or the Bridge stalls (the bench/brownout.sh regression: 1024 slots
+// and 8 salts ran out).
+func TestScratchSurvivesCrowding(t *testing.T) {
+	fs := &FaultyStore{Store: NewMemStore()}
+	fs.SetOutage(0.25)
+	for i := 0; i < 2000; i++ {
+		if err := bufferToScratch(fs, p.ObjectID(fmt.Sprintf("products:%d", i)), 1, ""); err != nil {
+			t.Fatalf("object %d of 2000: %v", i, err)
+		}
+	}
+}

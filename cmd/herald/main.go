@@ -295,7 +295,7 @@ func runBridge(ctx context.Context, cfg *Config, pg, slot, pub string, demoSetup
 		db.Close()
 	}
 	b := &bridge.Bridge{DSN: pg, Slot: slot, Publication: pub, Out: matcherClients(cfg)}
-	go bridge.WatchLag(ctx, pg, slot, 5*time.Second)
+	go bridge.WatchLag(ctx, pg, slot, time.Second)
 	for ctx.Err() == nil { // the slot makes every restart lossless
 		err := b.Run(ctx)
 		if ctx.Err() != nil {

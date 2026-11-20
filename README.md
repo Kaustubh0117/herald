@@ -153,6 +153,49 @@ on purpose, to batch work, and that is the trade-off this chart prices. At 500 m
 also receives about 13% fewer notifications. That's reliable *signaling* at work: several
 updates to one object inside a window collapse into one notification for the latest version.
 
+### Scale with clients (paper Fig. 6)
+
+![Scale with clients](docs/charts/scale-clients.png)
+
+`bench/scale-clients.sh` · same machine, single `herald-dev` process, 1k → 15k clients over
+real WebSockets, 5 objects each over 1,000 rows, 30 s heartbeat, 100 UPDATEs/s.
+
+CPU and memory grow linearly with clients: 0.24 cores and 531 MB at 15k, about 35 KB per
+client. The delay stays flat (p50 25–32 ms, p99 46–52 ms), set by the 50 ms batching
+window. The ramp stops at 15k because one macOS process can open only about 16k sockets to
+one address (the ephemeral port range), not because Herald runs out of headroom. The paper
+went much higher by spreading load over many machines.
+
+### Scale with notification rate (paper Fig. 7)
+
+![Scale with notification rate](docs/charts/scale-rate.png)
+
+`bench/scale-rate.sh` · 10,000 clients × 5 objects over 10,000 rows (about 5 notifications per
+UPDATE), 100 → 5,000 UPDATEs/s. That is up to about 25,000 notifications/s.
+
+CPU grows with the rate, and at 5,000 UPDATEs/s the whole cell (Bridge, Matchers, Registrars,
+gateway) uses 0.63 cores. The delay barely moves: p99 goes from 50 ms to 56 ms. Postgres,
+the load generator and Herald all share the same laptop, so treat the absolute numbers as an
+upper bound on Herald's cost, not a measurement of it.
+
+### Storage brown-out (paper Fig. 11)
+
+![Storage brown-out](docs/charts/brownout.png)
+
+`bench/brownout.sh` · `herald-dev -store`, 2,000 clients, 200 UPDATEs/s, with 25% of the
+Matcher key space unwritable from 30 s to 90 s (`server.FaultyStore`).
+
+Deliveries drop to about 77% of normal, the slot lag stays flat (a few KiB), and the Bridge
+never stalls. About 2,800 versions were parked, and they collapsed into 235 scratch rows,
+because successive versions of one object share a slot. All of them drained within a second
+of the outage ending, and clients caught up in one burst.
+
+This experiment found a bug that the unit tests and the simulation had missed. With 1,024
+scratch slots and 8 salts, one object eventually found all its slots either unwritable or
+taken by other parked objects. Its publish failed and the Bridge stalled for the rest of the
+outage. Scratch now has 65,536 slots and 16 salts, and `TestScratchSurvivesCrowding` parks
+2,000 objects to keep it that way.
+
 ## Develop
 
 ```sh

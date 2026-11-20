@@ -128,7 +128,7 @@ func main() {
 		}
 		http.Handle("GET /api/products", demo.Products(db))
 		go runBridge(ctx, &bridge.Bridge{DSN: *pg, Slot: *slot, Publication: *pub, Out: cell})
-		go bridge.WatchLag(ctx, *pg, *slot, 5*time.Second)
+		go bridge.WatchLag(ctx, *pg, *slot, time.Second)
 	} else {
 		log.Printf("no -pg given: Bridge disabled; use POST /publish to send versions")
 	}

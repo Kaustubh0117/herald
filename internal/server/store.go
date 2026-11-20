@@ -67,13 +67,19 @@ type MatcherStore interface {
 	LoadScratch(i, n int) ([]ScratchEntry, error) // entries for objects in server i of n's range
 }
 
-// ScratchSlots is the size of the scratch table. It also bounds what an
-// outage can leave behind: one slot per object, however hot the object.
-const ScratchSlots = 1024
+// ScratchSlots is the size of the scratch table's key space; rows exist
+// only while in use. It bounds what an outage can leave behind (one slot
+// per object, however hot), and it must be roomy: a slot taken by another
+// parked object is as useless as an unwritable one, and an object whose
+// every salt misses fails its publish, which stalls the Bridge's ordered
+// input for everyone. With 1024 slots and 8 salts, a one-minute brown-out
+// on 25% of keys did exactly that (bench/brownout.sh).
+const ScratchSlots = 1 << 16
 
 // scratchAttempts is how many salts bufferToScratch tries before giving up
-// (and failing the publish, which the Bridge then retries).
-const scratchAttempts = 8
+// (and failing the publish, which the Bridge then retries). With 25% of
+// slots unwritable and few taken, all of them miss with probability ~1e-10.
+const scratchAttempts = 16
 
 // ScratchSlot is the paper's "salted hash over the object ID, using the
 // retry count as the salt". Successive versions of one object land in the

@@ -7,7 +7,10 @@
 //
 // Results go to stdout as a table and, with -out, are appended as CSV rows
 // (one per stage) so bench scripts can chart them. With -metrics, the same
-// numbers are exported as herald_delivery_seconds{stage}.
+// numbers are exported as herald_delivery_seconds{stage}. With -cpu-pid,
+// the CSV also records how much CPU and memory that process (the cell)
+// used during the window; with -series, a per-second timeline is written,
+// and -outage-url can break part of the store halfway through it.
 package main
 
 import (
@@ -50,6 +53,13 @@ func main() {
 	label := flag.String("label", "", "free-form tag written to every CSV row (e.g. step=20ms)")
 	out := flag.String("out", "", "append CSV results to this file")
 	metricsAddr := flag.String("metrics", "", "serve Prometheus metrics on this address")
+	cpuPID := flag.Int("cpu-pid", 0, "record this process's CPU and RSS during the window (the cell)")
+	series := flag.String("series", "", "write a per-second timeline CSV here")
+	scrape := flag.String("scrape", "", "with -series: also sample this /metrics URL (scratch counters, slot lag)")
+	outageURL := flag.String("outage-url", "", "with -series: herald-dev's /admin/outage, to break part of the store")
+	outageAt := flag.Duration("outage-at", 30*time.Second, "outage start, from the start of the window")
+	outageFor := flag.Duration("outage-for", 60*time.Second, "outage length")
+	outageFrac := flag.Float64("outage-fraction", 0.25, "share of the Matcher key space that fails")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -79,9 +89,14 @@ func main() {
 	for _, s := range stages {
 		hists[s] = &hist{}
 	}
+	sec := &perSecond{h: &hist{}}
 	observe := func(n p.Notification, received time.Time) {
-		if !measuring.Load() || n.Stamps[p.StageCommit] == 0 {
+		if !measuring.Load() {
 			return
+		}
+		sec.delivered.Add(1)
+		if n.Stamps[p.StageCommit] == 0 {
+			return // not caused by a commit we stamped (post-propagation, drained scratch)
 		}
 		for _, d := range n.Stamps.Deltas(received) {
 			hists[d.Stage].add(d.D)
@@ -89,6 +104,7 @@ func main() {
 		}
 		total := received.Sub(time.UnixMicro(n.Stamps[p.StageCommit]))
 		hists["total"].add(total)
+		sec.add(total)
 		metrics.DeliverySeconds.WithLabelValues("total").Observe(total.Seconds())
 	}
 
@@ -123,21 +139,35 @@ func main() {
 	if db != nil {
 		go drive(ctx, db, *rate, *nObjects, &updates)
 	}
+	cpu0, _ := procStats(*cpuPID)
 	measuring.Store(true)
 	start := time.Now()
+	if *series != "" {
+		go writeSeries(ctx, *series, start, *duration, sec, &updates, *scrape)
+	}
+	if *outageURL != "" {
+		go outage(ctx, *outageURL, *outageAt, *outageFor, *outageFrac)
+	}
 	sleep(ctx, *duration)
 	measuring.Store(false)
 	elapsed := time.Since(start)
+	cpu1, rss := procStats(*cpuPID)
+	run := result{clients: int(connected.Load()), rate: *rate,
+		sent: float64(updates.Load()) / elapsed.Seconds(),
+		cpu:  (cpu1 - cpu0).Seconds() / elapsed.Seconds(), rssMB: rss / 1e6}
 
 	fmt.Printf("\n%d clients, %.0f updates/s requested, %.0f/s sent, %d notifications in %v\n",
-		connected.Load(), *rate, float64(updates.Load())/elapsed.Seconds(), hists["total"].count(), elapsed.Round(time.Second))
+		run.clients, run.rate, run.sent, hists["total"].count(), elapsed.Round(time.Second))
+	if *cpuPID != 0 {
+		fmt.Printf("cell process: %.2f cores, %.0f MB RSS\n", run.cpu, run.rssMB)
+	}
 	fmt.Printf("%-10s %10s %10s %10s %10s\n", "stage", "count", "p50", "p99", "mean")
 	for _, s := range stages {
 		h := hists[s]
 		fmt.Printf("%-10s %10d %10s %10s %10s\n", s, h.count(), ms(h.quantile(0.5)), ms(h.quantile(0.99)), ms(h.mean()))
 	}
 	if *out != "" {
-		if err := writeCSV(*out, *label, int(connected.Load()), *rate, hists); err != nil {
+		if err := writeCSV(*out, *label, run, hists); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -214,7 +244,13 @@ func drive(ctx context.Context, db *pgxpool.Pool, rate float64, nObjects int, se
 	}
 }
 
-func writeCSV(path, label string, clients int, rate float64, hists map[string]*hist) error {
+type result struct {
+	clients    int
+	rate, sent float64 // UPDATEs per second: requested, achieved
+	cpu, rssMB float64 // the cell process: cores used, resident memory
+}
+
+func writeCSV(path, label string, r result, hists map[string]*hist) error {
 	_, statErr := os.Stat(path)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -223,12 +259,15 @@ func writeCSV(path, label string, clients int, rate float64, hists map[string]*h
 	defer f.Close()
 	w := csv.NewWriter(f)
 	if os.IsNotExist(statErr) {
-		w.Write([]string{"label", "clients", "rate", "stage", "count", "p50_ms", "p99_ms", "mean_ms"})
+		w.Write([]string{"label", "clients", "rate", "stage", "count", "p50_ms", "p99_ms", "mean_ms",
+			"sent_rate", "server_cpu", "server_rss_mb"})
 	}
+	f2 := func(x float64) string { return strconv.FormatFloat(x, 'f', 2, 64) }
 	for _, s := range stages {
 		h := hists[s]
-		w.Write([]string{label, strconv.Itoa(clients), strconv.FormatFloat(rate, 'f', -1, 64), s,
-			strconv.FormatUint(h.count(), 10), msNum(h.quantile(0.5)), msNum(h.quantile(0.99)), msNum(h.mean())})
+		w.Write([]string{label, strconv.Itoa(r.clients), strconv.FormatFloat(r.rate, 'f', -1, 64), s,
+			strconv.FormatUint(h.count(), 10), msNum(h.quantile(0.5)), msNum(h.quantile(0.99)), msNum(h.mean()),
+			f2(r.sent), f2(r.cpu), f2(r.rssMB)})
 	}
 	w.Flush()
 	return w.Error()
