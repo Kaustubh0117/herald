@@ -45,11 +45,15 @@ func NewMatcherClient(conn *grpc.ClientConn) *MatcherClient {
 	return &MatcherClient{pb.NewMatcherClient(conn)}
 }
 
-func (m *MatcherClient) Publish(id p.ObjectID, v p.Version, src p.ClientID) error {
+func (m *MatcherClient) Publish(id p.ObjectID, v p.Version, src p.ClientID, stamps ...p.Stamps) error {
 	ctx, cancel := call()
 	defer cancel()
+	var s p.Stamps
+	if len(stamps) > 0 {
+		s = stamps[0]
+	}
 	_, err := m.c.Publish(ctx, &pb.PublishRequest{Items: []*pb.PublishRequest_Item{
-		{ObjectId: string(id), Version: int64(v), SourceClient: string(src)},
+		{ObjectId: string(id), Version: int64(v), SourceClient: string(src), Stamps: stampsToPB(s)},
 	}})
 	return err
 }
@@ -122,8 +126,8 @@ func (r *RegistrarClient) Handle(m p.ClientMessage) (p.ServerMessage, error) {
 type Matchers []server.MatcherAPI
 
 // Publish is the Bridge's entry point.
-func (ms Matchers) Publish(id p.ObjectID, v p.Version, src p.ClientID) error {
-	return ms[p.Owner(string(id), len(ms))].Publish(id, v, src)
+func (ms Matchers) Publish(id p.ObjectID, v p.Version, src p.ClientID, stamps ...p.Stamps) error {
+	return ms[p.Owner(string(id), len(ms))].Publish(id, v, src, stamps...)
 }
 
 // Router is a gateway's Handler: it sends each client message to the

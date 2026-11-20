@@ -126,6 +126,33 @@ open http://localhost:3000      # Grafana, Herald dashboard, no login
 | `herald_clients_online` | gauge | open WebSockets per gateway |
 | `herald_scratch_buffered_total`, `herald_scratch_drained_total` | counter | partial storage outages (paper Fig. 11) |
 
+## Benchmarks
+
+Every notification carries a timestamp from each stage it crosses: the commit, the Bridge, the
+Matcher, the Registrar and the gateway (paper §6.3). The client turns those into per-stage
+delays. [bin/herald-load](cmd/herald-load/main.go) opens thousands of simulated clients over
+real WebSockets and drives UPDATEs into Postgres. It reports p50, p99 and mean delays per stage
+and exports them as `herald_delivery_seconds{stage}`.
+Each chart has one script that regenerates it from scratch, and the raw CSVs are in
+[bench/results](bench/results).
+
+### Latency budget (paper Fig. 9)
+
+![Latency budget](docs/charts/latency-budget.png)
+
+`bench/latency.sh` · Apple M5 (10 cores, 16 GB), single `herald-dev` process (one clock, so
+stage deltas are exact), local Postgres 16, 1,000 clients × 5 objects, 100 UPDATEs/s, 30 s per
+run after 10 s of warm-up.
+
+As in the paper, the batching window dominates. The `registrar` stage is the time from a
+Matcher accepting a version until its propagator delivers it, which averages half the window.
+Everything else is a fraction of a millisecond: commit to Bridge about 0.2 ms, Matcher about
+10 µs, and gateway to client about 0.3 ms. With a 1 ms window, the median from commit to client
+is **1.1 ms** and the p99 is **1.9 ms**. The paper's production system ran a 200–500 ms window
+on purpose, to batch work, and that is the trade-off this chart prices. At 500 ms, the client
+also receives about 13% fewer notifications. That's reliable *signaling* at work: several
+updates to one object inside a window collapse into one notification for the latest version.
+
 ## Develop
 
 ```sh

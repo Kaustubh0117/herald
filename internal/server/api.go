@@ -13,7 +13,7 @@ import (
 // MatcherAPI is what Registrars and the Bridge call on a Matcher.
 // Every method is idempotent, so callers handle failure by retrying.
 type MatcherAPI interface {
-	Publish(id p.ObjectID, v p.Version, source p.ClientID) error
+	Publish(id p.ObjectID, v p.Version, source p.ClientID, stamps ...p.Stamps) error
 	AddRegistration(id p.ObjectID, c p.ClientID) error
 	RemoveRegistration(id p.ObjectID, c p.ClientID) error
 	LatestVersion(id p.ObjectID) (v p.Version, known bool, err error)

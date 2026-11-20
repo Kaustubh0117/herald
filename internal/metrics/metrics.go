@@ -58,6 +58,15 @@ var (
 		Name: "herald_clients_online",
 		Help: "Open client WebSocket connections on this gateway.",
 	})
+
+	// DeliverySeconds is the time a notification spent reaching each stage
+	// from the previous one, measured by clients from the stage stamps
+	// (paper Sec. 6.3, Fig. 9); stage="total" is commit to client.
+	DeliverySeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "herald_delivery_seconds",
+		Help:    "Per-stage notification delay, from stage stamps; stage=total is commit to client.",
+		Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16), // 0.5 ms .. 16 s
+	}, []string{"stage"})
 )
 
 // PendingNotifications exports the unacked backlog, computed by f when

@@ -8,6 +8,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -86,6 +87,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			g.conns[me] = c
 			g.mu.Unlock()
 		}
+		stampGateway(resp.Notifications)
 		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err = wsjson.Write(wctx, c, Frame{Resp: &resp})
 		cancel()
@@ -105,9 +107,21 @@ func (g *Gateway) Push(client p.ClientID, ns []p.Notification) {
 	if c == nil {
 		return
 	}
+	ns = slices.Clone(ns) // the Registrar may reuse its slice
+	stampGateway(ns)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = wsjson.Write(ctx, c, Frame{Push: ns}) // Conn writes are safe concurrently
 	}()
+}
+
+// stampGateway records when notifications left for the client's socket.
+func stampGateway(ns []p.Notification) {
+	now := time.Now()
+	for i := range ns {
+		if ns[i].Stamps[p.StageCommit] != 0 {
+			ns[i].Stamps.Stamp(p.StageGateway, now)
+		}
+	}
 }

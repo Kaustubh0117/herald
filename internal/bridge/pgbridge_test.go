@@ -25,7 +25,7 @@ type recorder struct {
 	v        map[p.ObjectID]p.Version
 }
 
-func (r *recorder) Publish(id p.ObjectID, v p.Version, _ p.ClientID) error {
+func (r *recorder) Publish(id p.ObjectID, v p.Version, _ p.ClientID, _ ...p.Stamps) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
@@ -214,6 +214,7 @@ func TestEndToEnd(t *testing.T) {
 	c := client.New(client.Config{
 		Send:     cell.Handle,
 		Listener: l,
+		Observe:  l.observe,
 	})
 	c.Register("products:1")
 	go c.Run(bctx, 5*time.Millisecond)
@@ -224,12 +225,51 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return l.latest() > 0 })
+
+	// The notification carries a stamp from every stage it crossed, in
+	// order, starting at the commit (paper Sec. 6.3, Fig. 9). Wait for a
+	// stamped one: the INSERT's version can also arrive by post-propagation,
+	// which isn't caused by a commit and carries no stamps.
+	waitFor(t, func() bool { return l.lastStamps()[p.StageCommit] != 0 })
+	s := l.lastStamps()
+	for _, st := range []p.Stage{p.StageCommit, p.StageBridge, p.StageMatcher, p.StageRegistrar} {
+		if s[st] == 0 {
+			t.Fatalf("missing %s stamp: %v", st, s)
+		}
+	}
+	ds := s.Deltas(time.Now())
+	var total time.Duration
+	for _, d := range ds {
+		if d.D < 0 {
+			t.Fatalf("stage %s went back in time: %v", d.Stage, ds)
+		}
+		total += d.D
+	}
+	if total <= 0 || total > 10*time.Second {
+		t.Fatalf("commit-to-client delay %v is implausible: %v", total, ds)
+	}
+	t.Logf("commit to client in %v: %v", total, ds)
 }
 
 type notifyLog struct {
-	mu sync.Mutex
-	n  int
-	v  p.Version
+	mu     sync.Mutex
+	n      int
+	v      p.Version
+	stamps p.Stamps // of the latest notification that had any
+}
+
+func (l *notifyLog) observe(n p.Notification, _ time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if n.Stamps != (p.Stamps{}) {
+		l.stamps = n.Stamps
+	}
+}
+
+func (l *notifyLog) lastStamps() p.Stamps {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.stamps
 }
 
 func (l *notifyLog) Notify(_ p.ObjectID, v p.Version) {

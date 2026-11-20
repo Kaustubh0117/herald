@@ -21,7 +21,8 @@ type MatcherServer struct {
 
 func (s *MatcherServer) Publish(_ context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
 	for _, it := range req.Items {
-		if err := s.M.Publish(p.ObjectID(it.ObjectId), p.Version(it.Version), p.ClientID(it.SourceClient)); err != nil {
+		if err := s.M.Publish(p.ObjectID(it.ObjectId), p.Version(it.Version), p.ClientID(it.SourceClient),
+			stampsFromPB(it.Stamps)); err != nil {
 			return nil, err
 		}
 	}

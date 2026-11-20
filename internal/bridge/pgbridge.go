@@ -29,8 +29,10 @@ import (
 )
 
 // Publisher is the Bridge's view of a cell (server.Cell satisfies it).
+// stamps, if given, carry the commit and Bridge times for latency
+// measurement.
 type Publisher interface {
-	Publish(id p.ObjectID, v p.Version, source p.ClientID) error
+	Publish(id p.ObjectID, v p.Version, source p.ClientID, stamps ...p.Stamps) error
 }
 
 type Bridge struct {
@@ -193,8 +195,11 @@ func (b *Bridge) Run(ctx context.Context) error {
 				}
 			case *pglogrepl.CommitMessage:
 				v := p.Version(m.CommitLSN)
+				var stamps p.Stamps
+				stamps.Stamp(p.StageCommit, m.CommitTime)
+				stamps.Stamp(p.StageBridge, time.Now())
 				for id := range cur.objects {
-					if err := b.publish(ctx, id, v); err != nil {
+					if err := b.publish(ctx, id, v, stamps); err != nil {
 						return err
 					}
 				}
@@ -208,10 +213,10 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 // publish retries until the cell accepts the version or ctx ends. Blind
 // retries are safe because Publish is idempotent and only moves forward.
-func (b *Bridge) publish(ctx context.Context, id p.ObjectID, v p.Version) error {
+func (b *Bridge) publish(ctx context.Context, id p.ObjectID, v p.Version, stamps p.Stamps) error {
 	backoff := 10 * time.Millisecond
 	for {
-		err := b.Out.Publish(id, v, "")
+		err := b.Out.Publish(id, v, "", stamps)
 		if err == nil {
 			metrics.PublishTotal.Inc()
 			return nil

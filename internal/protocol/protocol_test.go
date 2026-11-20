@@ -2,8 +2,10 @@ package protocol
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDigestOrderIndependent(t *testing.T) {
@@ -126,6 +128,30 @@ func TestOwnerSpreadsSequentialKeys(t *testing.T) {
 			if want := keys / n; c < want*9/10 || c > want*11/10 {
 				t.Errorf("n=%d: server %d owns %d of %d keys, want about %d", n, s, c, keys, want)
 			}
+		}
+	}
+}
+
+func TestStampDeltas(t *testing.T) {
+	base := time.UnixMicro(1_000_000)
+	var s Stamps
+	s.Stamp(StageCommit, base)
+	s.Stamp(StageBridge, base.Add(5*time.Millisecond))
+	// matcher not stamped: its time folds into the registrar stage
+	s.Stamp(StageRegistrar, base.Add(25*time.Millisecond))
+	s.Stamp(StageGateway, base.Add(26*time.Millisecond))
+	got := s.Deltas(base.Add(30 * time.Millisecond))
+	want := []StageDelta{{"bridge", 5 * time.Millisecond}, {"registrar", 20 * time.Millisecond},
+		{"gateway", time.Millisecond}, {"client", 4 * time.Millisecond}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v\nwant %v", got, want)
+	}
+	if (Stamps{}).Deltas(base) != nil {
+		t.Fatal("no commit stamp should give no deltas")
+	}
+	for st := StageCommit; st < NumStages; st++ {
+		if back, ok := StageByName(st.String()); !ok || back != st {
+			t.Fatalf("StageByName(%q) = %v, %v", st, back, ok)
 		}
 	}
 }

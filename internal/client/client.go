@@ -35,14 +35,19 @@ type SendFunc func(p.ClientMessage) (p.ServerMessage, error)
 type Config struct {
 	Send     SendFunc
 	Listener Listener
-	State    []byte // from a previous WriteState; nil for a brand-new client
-	Addr     string // optional: where fast-path pushes reach us (gateways overwrite it)
+	// Observe, if set, sees every notification handed to the Listener,
+	// with the time it arrived: the load generator turns its stage stamps
+	// into herald_delivery_seconds (paper Fig. 9).
+	Observe func(n p.Notification, received time.Time)
+	State   []byte // from a previous WriteState; nil for a brand-new client
+	Addr    string // optional: where fast-path pushes reach us (gateways overwrite it)
 }
 
 type Client struct {
-	send SendFunc
-	l    Listener
-	addr string
+	send    SendFunc
+	l       Listener
+	addr    string
+	observe func(p.Notification, time.Time)
 
 	mu       sync.Mutex
 	tok      *p.Token
@@ -62,6 +67,7 @@ func New(cfg Config) *Client {
 		send:     cfg.Send,
 		l:        cfg.Listener,
 		addr:     cfg.Addr,
+		observe:  cfg.Observe,
 		intents:  map[p.ObjectID]bool{},
 		toReg:    map[p.ObjectID]bool{},
 		toUnreg:  map[p.ObjectID]bool{},
@@ -246,7 +252,11 @@ func (c *Client) OnPush(ns []p.Notification) {
 	}
 	c.mu.Unlock()
 
+	now := time.Now()
 	for _, n := range deliver {
+		if c.observe != nil {
+			c.observe(n, now)
+		}
 		if n.Unknown {
 			c.l.NotifyUnknown(n.Object)
 		} else {

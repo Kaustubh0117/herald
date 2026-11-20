@@ -342,6 +342,9 @@ func (r *Registrar) PendingNotifications() int {
 // Deliver is called by Matchers. It stores the notification as pending
 // and tries the unreliable fast path.
 func (r *Registrar) Deliver(c p.ClientID, n p.Notification) error {
+	if n.Stamps[p.StageCommit] != 0 {
+		n.Stamps.Stamp(p.StageRegistrar, time.Now())
+	}
 	r.mu.Lock()
 	st, ok := r.clients[c]
 	if !ok || !st.regs[n.Object] {

@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/Kaustubh0117/herald/internal/metrics"
 	"github.com/Kaustubh0117/herald/internal/mutate"
@@ -16,6 +17,7 @@ type objState struct {
 	version p.Version
 	known   bool       // false until the first publish (or after a wipe)
 	source  p.ClientID // the writer, which is not notified of its own change
+	stamps  p.Stamps   // stage times of the latest version (measurement only)
 	// clients maps each registered client to a generation number that
 	// changes on every AddRegistration, so dropping a stale registration
 	// never removes one that was re-added meanwhile.
@@ -93,10 +95,15 @@ func (m *Matcher) obj(id p.ObjectID) *objState {
 // one ordered log, so a single failing object would otherwise stall every
 // notification behind it. Drain moves the version into place later, and
 // only then is it applied and propagated (paper Sec. 4.2.6).
-func (m *Matcher) Publish(id p.ObjectID, v p.Version, source p.ClientID) error {
+func (m *Matcher) Publish(id p.ObjectID, v p.Version, source p.ClientID, stamps ...p.Stamps) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	err := m.apply(id, v, source)
+	var s p.Stamps
+	if len(stamps) > 0 {
+		s = stamps[0]
+	}
+	s.Stamp(p.StageMatcher, time.Now())
+	err := m.apply(id, v, source, s)
 	if err == nil || mutate.NoScratch {
 		return err
 	}
@@ -108,7 +115,7 @@ func (m *Matcher) Publish(id p.ObjectID, v p.Version, source p.ClientID) error {
 }
 
 // apply writes a version to the store, then to memory. Caller holds m.mu.
-func (m *Matcher) apply(id p.ObjectID, v p.Version, source p.ClientID) error {
+func (m *Matcher) apply(id p.ObjectID, v p.Version, source p.ClientID, stamps p.Stamps) error {
 	st := m.obj(id)
 	if st.known && v <= st.version {
 		return nil // duplicate or reordered publish: nothing to do
@@ -118,7 +125,7 @@ func (m *Matcher) apply(id p.ObjectID, v p.Version, source p.ClientID) error {
 			return err
 		}
 	}
-	st.version, st.known, st.source = v, true, source
+	st.version, st.known, st.source, st.stamps = v, true, source, stamps
 	m.pending[id] = true
 	return nil
 }
@@ -138,7 +145,7 @@ func (m *Matcher) Drain() error {
 	slices.SortFunc(es, func(a, b ScratchEntry) int { return a.Slot - b.Slot }) // deterministic for the sim
 	for _, e := range es {
 		m.mu.Lock()
-		err := m.apply(e.Object, e.Version, e.Source)
+		err := m.apply(e.Object, e.Version, e.Source, p.Stamps{}) // stamps aren't parked
 		m.mu.Unlock()
 		if err != nil {
 			continue // still unwritable: next pass
@@ -203,6 +210,7 @@ func (m *Matcher) Propagate() {
 		id      p.ObjectID
 		v       p.Version
 		source  p.ClientID
+		stamps  p.Stamps
 		clients map[p.ClientID]uint64
 	}
 	// Snapshot under the lock, then call Registrars without holding it, so a
@@ -211,7 +219,7 @@ func (m *Matcher) Propagate() {
 	var jobs []job
 	for _, id := range slices.Sorted(maps.Keys(m.pending)) {
 		st := m.objects[id]
-		jobs = append(jobs, job{id, st.version, st.source, maps.Clone(st.clients)})
+		jobs = append(jobs, job{id, st.version, st.source, st.stamps, maps.Clone(st.clients)})
 	}
 	m.mu.Unlock()
 
@@ -221,7 +229,7 @@ func (m *Matcher) Propagate() {
 			if c == j.source {
 				continue // the writer already knows about its own change
 			}
-			n := p.Notification{Object: j.id, Version: j.v}
+			n := p.Notification{Object: j.id, Version: j.v, Stamps: j.stamps}
 			err := m.route(c).Deliver(c, n)
 			if errors.Is(err, ErrNotRegistered) {
 				// A stale registration (client collected or gone): drop it,

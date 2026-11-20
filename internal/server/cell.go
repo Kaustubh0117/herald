@@ -221,8 +221,8 @@ func (c *Cell) Handle(m p.ClientMessage) (p.ServerMessage, error) {
 
 // Publish is the Bridge's entry point. It can fail (fault injection now,
 // a network error later); the caller retries until it succeeds.
-func (c *Cell) Publish(id p.ObjectID, v p.Version, source p.ClientID) error {
-	return c.ms[p.Owner(string(id), len(c.ms))].Publish(id, v, source)
+func (c *Cell) Publish(id p.ObjectID, v p.Version, source p.ClientID, stamps ...p.Stamps) error {
+	return c.ms[p.Owner(string(id), len(c.ms))].Publish(id, v, source, stamps...)
 }
 
 // Step runs one pass of every propagator. Tests call it directly for
@@ -251,11 +251,11 @@ type matcherSlot struct {
 	i int
 }
 
-func (s matcherSlot) Publish(id p.ObjectID, v p.Version, src p.ClientID) error {
+func (s matcherSlot) Publish(id p.ObjectID, v p.Version, src p.ClientID, stamps ...p.Stamps) error {
 	if s.c.fail() {
 		return ErrInjected
 	}
-	return s.c.matcher(s.i).Publish(id, v, src)
+	return s.c.matcher(s.i).Publish(id, v, src, stamps...)
 }
 
 func (s matcherSlot) AddRegistration(id p.ObjectID, cl p.ClientID) error {

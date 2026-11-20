@@ -30,6 +30,7 @@ type Notification struct {
 	Version Version
 	Unknown bool
 	Seq     uint64 // orders unknown-version notifications for one client
+	Stamps  Stamps // per-stage times, for latency measurement only
 }
 
 // Token identifies a client to one incarnation of one cell. When a cell is

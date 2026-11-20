@@ -11,3 +11,9 @@ scrape_configs:
       - source_labels: [__address__]
         regex: "([^:]+):.*"
         target_label: component
+
+  # bin/herald-load -metrics :9103 running on the host (Phase 10 experiments).
+  - job_name: loadgen
+    static_configs:
+      - targets: ["host.docker.internal:9103"]
+        labels: { component: loadgen }

@@ -351,6 +351,110 @@
           }
         }
       ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Delivery latency, commit to client",
+      "description": "Measured by clients (bin/herald-load -metrics :9103) from the stage stamps every notification carries.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(herald_delivery_seconds_bucket{stage=\"total\"}[1m])))"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(herald_delivery_seconds_bucket{stage=\"total\"}[1m])))"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Where the time goes (paper Fig. 9)",
+      "description": "Mean time to reach each stage from the previous one. Expect the propagator batching window (registrar) to dominate. Stages stamped in different processes compare different clocks: against the docker cell, the gateway->client stage can even read slightly negative (VM vs host clock skew).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "legendFormat": "{{stage}}",
+          "expr": "sum by (stage) (rate(herald_delivery_seconds_sum{stage!=\"total\"}[1m])) / sum by (stage) (rate(herald_delivery_seconds_count{stage!=\"total\"}[1m]))"
+        }
+      ]
     }
   ]
 }

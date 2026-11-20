@@ -25,11 +25,33 @@ func tokenFromPB(t *pb.Token) *p.Token {
 }
 
 func notifToPB(n p.Notification) *pb.Notification {
-	return &pb.Notification{ObjectId: string(n.Object), Version: int64(n.Version), Unknown: n.Unknown, Seq: n.Seq}
+	return &pb.Notification{ObjectId: string(n.Object), Version: int64(n.Version), Unknown: n.Unknown, Seq: n.Seq,
+		Stamps: stampsToPB(n.Stamps)}
 }
 
 func notifFromPB(n *pb.Notification) p.Notification {
-	return p.Notification{Object: p.ObjectID(n.ObjectId), Version: p.Version(n.Version), Unknown: n.Unknown, Seq: n.Seq}
+	return p.Notification{Object: p.ObjectID(n.ObjectId), Version: p.Version(n.Version), Unknown: n.Unknown, Seq: n.Seq,
+		Stamps: stampsFromPB(n.Stamps)}
+}
+
+// stampsToPB sends only the stages that were stamped.
+func stampsToPB(s p.Stamps) []*pb.StageStamp {
+	var out []*pb.StageStamp
+	for st, at := range s {
+		if at != 0 {
+			out = append(out, &pb.StageStamp{Stage: p.Stage(st).String(), AtMicros: at})
+		}
+	}
+	return out
+}
+
+func stampsFromPB(ss []*pb.StageStamp) (s p.Stamps) {
+	for _, x := range ss {
+		if st, ok := p.StageByName(x.Stage); ok {
+			s[st] = x.AtMicros
+		}
+	}
+	return s
 }
 
 func notifsToPB(ns []p.Notification) []*pb.Notification {
