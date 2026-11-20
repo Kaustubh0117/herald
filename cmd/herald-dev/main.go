@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/Kaustubh0117/herald/internal/bridge"
 	"github.com/Kaustubh0117/herald/internal/demo"
@@ -40,6 +41,7 @@ func main() {
 	var gw *gateway.Gateway
 	push := func(_ string, c p.ClientID, ns []p.Notification) { gw.Push(c, ns) }
 	cell := server.NewCell("dev", 2, 2, push)
+	var faulty *server.FaultyStore // with -store: lets /admin/outage break part of it
 	if *persist {
 		if *pg == "" {
 			log.Fatal("-store needs -pg")
@@ -52,7 +54,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("store: %v", err)
 		}
-		if cell, err = server.NewCellWithStore("dev", 2, 2, push, st); err != nil {
+		faulty = &server.FaultyStore{Store: st}
+		if cell, err = server.NewCellWithStore("dev", 2, 2, push, faulty); err != nil {
 			log.Fatalf("loading state: %v", err)
 		}
 		log.Printf("soft state in Postgres schema herald_dev: restarts reload it, Wipe truncates it")
@@ -94,6 +97,24 @@ func main() {
 		}
 		log.Printf("cell wiped: all server state discarded")
 	})
+
+	// Partial storage outage (Phase 8): POST /admin/outage?fraction=0.25
+	// makes a quarter of the Matcher key space unwritable; fraction=0 ends it.
+	// Watch herald_scratch_buffered_total on /metrics while it lasts.
+	http.HandleFunc("POST /admin/outage", func(w http.ResponseWriter, r *http.Request) {
+		if faulty == nil {
+			http.Error(w, "outages need -store", http.StatusBadRequest)
+			return
+		}
+		f, err := strconv.ParseFloat(r.URL.Query().Get("fraction"), 64)
+		if err != nil || f < 0 || f > 1 {
+			http.Error(w, "fraction must be between 0 and 1", http.StatusBadRequest)
+			return
+		}
+		faulty.SetOutage(f)
+		log.Printf("storage outage: %.0f%% of the Matcher key space unwritable", f*100)
+	})
+	http.Handle("GET /metrics", promhttp.Handler())
 
 	if *pg != "" {
 		db, err := pgxpool.New(ctx, *pg)

@@ -50,3 +50,15 @@ CREATE TABLE IF NOT EXISTS {S}.registrar_notifications ( -- unacked, collapsed p
     seq         bigint NOT NULL,
     PRIMARY KEY (client_pkey, object_id)
 );
+
+-- Versions parked while their matcher_objects row was unwritable (paper
+-- Sec. 4.2.6). slot = ScratchSlot(object_id, attempt): a salted hash, so
+-- successive versions of one object overwrite each other. At most
+-- ScratchSlots rows, so the Matchers' drain scans need no index.
+CREATE TABLE IF NOT EXISTS {S}.scratch (
+    slot          int PRIMARY KEY,
+    obj_pkey      text NOT NULL,                -- PartitionKey(object_id): which Matcher drains it
+    object_id     text NOT NULL,
+    version       bigint NOT NULL,
+    source_client text NOT NULL DEFAULT ''
+);

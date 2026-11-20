@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/Kaustubh0117/herald/internal/metrics"
 	"github.com/Kaustubh0117/herald/internal/mutate"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 )
@@ -27,6 +28,8 @@ type Matcher struct {
 	epoch      uint64
 	registrars []RegistrarAPI // routed by protocol.Owner(client)
 	store      MatcherStore   // nil: memory only
+	part       int            // with a store: this is Matcher part of parts,
+	parts      int            // whose scratch entries Drain moves into place
 
 	mu      sync.Mutex
 	gen     uint64
@@ -47,7 +50,7 @@ func NewMatcher(epoch uint64, registrars []RegistrarAPI) *Matcher {
 // resumes propagating whatever was still pending (paper Sec. 4.2.5).
 func LoadMatcher(epoch uint64, registrars []RegistrarAPI, st MatcherStore, i, n int) (*Matcher, error) {
 	m := NewMatcher(epoch, registrars)
-	m.store = st
+	m.store, m.part, m.parts = st, i, n
 	rows, err := st.LoadMatcher(i, n)
 	if err != nil {
 		return nil, err
@@ -84,9 +87,28 @@ func (m *Matcher) obj(id p.ObjectID) *objState {
 
 // Publish records a new version. It is idempotent and only moves forward,
 // so the Bridge can retry it blindly (paper: "idempotent operations only").
+//
+// If the object's row is unwritable (a partial storage outage), the version
+// is parked in scratch instead and Publish still succeeds: the Bridge reads
+// one ordered log, so a single failing object would otherwise stall every
+// notification behind it. Drain moves the version into place later, and
+// only then is it applied and propagated (paper Sec. 4.2.6).
 func (m *Matcher) Publish(id p.ObjectID, v p.Version, source p.ClientID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	err := m.apply(id, v, source)
+	if err == nil || mutate.NoScratch {
+		return err
+	}
+	if err := bufferToScratch(m.store, id, v, source); err != nil {
+		return err
+	}
+	metrics.ScratchBuffered.Inc()
+	return nil
+}
+
+// apply writes a version to the store, then to memory. Caller holds m.mu.
+func (m *Matcher) apply(id p.ObjectID, v p.Version, source p.ClientID) error {
 	st := m.obj(id)
 	if st.known && v <= st.version {
 		return nil // duplicate or reordered publish: nothing to do
@@ -98,6 +120,33 @@ func (m *Matcher) Publish(id p.ObjectID, v p.Version, source p.ClientID) error {
 	}
 	st.version, st.known, st.source = v, true, source
 	m.pending[id] = true
+	return nil
+}
+
+// Drain moves versions parked in scratch into place once their rows are
+// writable again. An entry leaves scratch only after its version is
+// applied; if the slot was overwritten by a newer version meanwhile, the
+// newer one stays for the next pass. Run it periodically.
+func (m *Matcher) Drain() error {
+	if m.store == nil || mutate.NoScratchDrain {
+		return nil
+	}
+	es, err := m.store.LoadScratch(m.part, m.parts)
+	if err != nil {
+		return err
+	}
+	slices.SortFunc(es, func(a, b ScratchEntry) int { return a.Slot - b.Slot }) // deterministic for the sim
+	for _, e := range es {
+		m.mu.Lock()
+		err := m.apply(e.Object, e.Version, e.Source)
+		m.mu.Unlock()
+		if err != nil {
+			continue // still unwritable: next pass
+		}
+		if m.store.DeleteScratch(e) == nil {
+			metrics.ScratchDrained.Inc()
+		}
+	}
 	return nil
 }
 

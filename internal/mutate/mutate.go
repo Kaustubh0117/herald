@@ -43,6 +43,15 @@ var (
 	// (yet) registered for. This was a real bug the simulation found: a
 	// restarted client acked pushes before restoring its intents.
 	AckUnregistered = on("ack-unregistered")
+
+	// NoScratch: a publish whose Matcher row is unwritable fails instead of
+	// being parked in scratch, so one bad key range stalls the Bridge's
+	// ordered input for every object behind it.
+	NoScratch = on("no-scratch")
+
+	// NoScratchDrain: versions parked in scratch are never moved into the
+	// Matcher table, so they are acked to the Bridge and then lost.
+	NoScratchDrain = on("no-scratch-drain")
 )
 
 func on(name string) bool {

@@ -12,6 +12,6 @@ count() {
 }
 
 printf '%-24s %s\n' "mutation" "violations ($SEEDS seeds)"
-for m in none no-post-propagation no-registration-sync no-retransmission matcher-drops-failed no-matcher-resync memory-before-store no-replay-pending ack-unregistered; do
+for m in none no-post-propagation no-registration-sync no-retransmission matcher-drops-failed no-matcher-resync memory-before-store no-replay-pending ack-unregistered no-scratch no-scratch-drain; do
   printf '%-24s %s\n' "$m" "$(count "$m")"
 done

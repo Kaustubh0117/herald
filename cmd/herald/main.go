@@ -9,6 +9,7 @@
 //
 // With -store, matchers and registrars keep their soft state in Postgres
 // (-pg) and reload it when restarted, instead of making clients re-sync.
+// -metrics ADDR serves Prometheus metrics at ADDR/metrics.
 //
 // For a single process running everything, use herald-dev instead.
 package main
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"gopkg.in/yaml.v3"
 
@@ -66,6 +68,7 @@ func main() {
 	demoSetup := fs.Bool("demo", false, "bridge: create the demo table, publication and slot if missing")
 	persist := fs.Bool("store", false, "matcher/registrar: keep soft state in Postgres (-pg) and reload it on restart")
 	gcTTL := fs.Duration("gc-ttl", 24*time.Hour, "registrar: garbage-collect clients idle this long")
+	metricsAddr := fs.String("metrics", "", "serve Prometheus metrics on this address (e.g. :9102)")
 	fs.Parse(args)
 
 	cfg, err := loadConfig(*configPath)
@@ -75,6 +78,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	log.SetPrefix(fmt.Sprintf("[%s] ", cmd))
+	if *metricsAddr != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("GET /metrics", promhttp.Handler())
+			log.Fatal(http.ListenAndServe(*metricsAddr, mux))
+		}()
+	}
 
 	var st server.Store
 	if *persist || cmd == "wipe" {
@@ -211,6 +221,11 @@ func runMatcher(ctx context.Context, cfg *Config, i int, st server.Store) {
 		log.Printf("loaded state from Postgres (epoch %d)", e)
 	}
 	go every(ctx, cfg.Step, m.Propagate)
+	go every(ctx, time.Second, func() { // move versions parked during an outage into place
+		if err := m.Drain(); err != nil {
+			log.Printf("drain: %v", err)
+		}
+	})
 	serveGRPC(ctx, cfg.Matchers[i], func(s *grpc.Server) { pb.RegisterMatcherServer(s, &rpc.MatcherServer{M: m}) })
 }
 

@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -43,12 +44,62 @@ type StoredClient struct {
 	Pending  []p.Notification
 }
 
+// ScratchEntry is a version parked in the scratch table because its
+// Matcher row was unwritable (paper Sec. 4.2.6).
+type ScratchEntry struct {
+	Slot    int
+	Object  p.ObjectID
+	Version p.Version
+	Source  p.ClientID
+}
+
 type MatcherStore interface {
 	SaveVersion(id p.ObjectID, v p.Version, source p.ClientID) error // and mark pending; never moves back
 	ClearPending(id p.ObjectID, v p.Version) error                   // only if still at version v
 	SaveMatcherReg(id p.ObjectID, c p.ClientID) error
 	DeleteMatcherReg(id p.ObjectID, c p.ClientID) error
 	LoadMatcher(i, n int) ([]StoredObject, error) // server i of n's key range
+
+	// SaveScratch parks e in slot e.Slot, replacing an older version of the
+	// same object. It reports false if the slot holds a different object.
+	SaveScratch(e ScratchEntry) (bool, error)
+	DeleteScratch(e ScratchEntry) error           // only if the slot still holds e's version
+	LoadScratch(i, n int) ([]ScratchEntry, error) // entries for objects in server i of n's range
+}
+
+// ScratchSlots is the size of the scratch table. It also bounds what an
+// outage can leave behind: one slot per object, however hot the object.
+const ScratchSlots = 1024
+
+// scratchAttempts is how many salts bufferToScratch tries before giving up
+// (and failing the publish, which the Bridge then retries).
+const scratchAttempts = 8
+
+// ScratchSlot is the paper's "salted hash over the object ID, using the
+// retry count as the salt". Successive versions of one object land in the
+// same slot and overwrite each other, so a hot object uses one slot, not one
+// row per update; a different salt usually lands on a different tablet.
+func ScratchSlot(id p.ObjectID, attempt int) int {
+	return p.Owner(fmt.Sprintf("%s#%d", id, attempt), ScratchSlots)
+}
+
+// bufferToScratch parks a version whose Matcher row could not be written,
+// trying successive salts past slots that are taken or unwritable.
+func bufferToScratch(st MatcherStore, id p.ObjectID, v p.Version, src p.ClientID) error {
+	var err error
+	for attempt := 0; attempt < scratchAttempts; attempt++ {
+		ok, e := st.SaveScratch(ScratchEntry{ScratchSlot(id, attempt), id, v, src})
+		if e == nil && ok {
+			return nil
+		}
+		if e != nil {
+			err = e
+		}
+	}
+	if err == nil {
+		err = errors.New("no free slot")
+	}
+	return fmt.Errorf("scratch %s: %w", id, err)
 }
 
 type RegistrarStore interface {
@@ -90,6 +141,7 @@ type MemStore struct {
 	clients map[p.ClientID]*StoredClient
 	cregs   map[p.ClientID]map[p.ObjectID]StoredReg
 	notifs  map[p.ClientID]map[p.ObjectID]p.Notification
+	scratch map[int]ScratchEntry
 }
 
 func NewMemStore() *MemStore {
@@ -104,6 +156,7 @@ func (s *MemStore) reset() {
 	s.clients = map[p.ClientID]*StoredClient{}
 	s.cregs = map[p.ClientID]map[p.ObjectID]StoredReg{}
 	s.notifs = map[p.ClientID]map[p.ObjectID]p.Notification{}
+	s.scratch = map[int]ScratchEntry{}
 }
 
 // write locks the store and reports whether an injected failure hit.
@@ -203,6 +256,44 @@ func (s *MemStore) LoadMatcher(i, n int) ([]StoredObject, error) {
 	var out []StoredObject
 	for _, o := range byID {
 		out = append(out, *o)
+	}
+	return out, nil
+}
+
+func (s *MemStore) SaveScratch(e ScratchEntry) (bool, error) {
+	if err := s.write(); err != nil {
+		return false, err
+	}
+	defer s.mu.Unlock()
+	cur, ok := s.scratch[e.Slot]
+	if ok && cur.Object != e.Object {
+		return false, nil
+	}
+	if !ok || cur.Version < e.Version {
+		s.scratch[e.Slot] = e
+	}
+	return true, nil
+}
+
+func (s *MemStore) DeleteScratch(e ScratchEntry) error {
+	if err := s.write(); err != nil {
+		return err
+	}
+	defer s.mu.Unlock()
+	if cur, ok := s.scratch[e.Slot]; ok && cur.Object == e.Object && cur.Version == e.Version {
+		delete(s.scratch, e.Slot)
+	}
+	return nil
+}
+
+func (s *MemStore) LoadScratch(i, n int) ([]ScratchEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []ScratchEntry
+	for _, e := range s.scratch {
+		if p.Owner(string(e.Object), n) == i {
+			out = append(out, e)
+		}
 	}
 	return out, nil
 }

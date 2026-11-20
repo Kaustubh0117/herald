@@ -1,8 +1,10 @@
 // Package sim is Herald's correctness test: a whole cell plus many clients
 // in one process, under message loss, RPC failures, client restarts and
-// single-server crashes and total server state loss. It checks the paper's reliable-delivery
+// single-server crashes, total server state loss and (with a store)
+// partial storage outages. It checks the paper's reliable-delivery
 // property (Sec. 5): every well-behaved client eventually learns the
-// latest version of every object it is registered for.
+// latest version of every object it is registered for. With a store it
+// also checks that an outage doesn't stall the Bridge's input.
 //
 // Everything is driven by one seeded RNG and runs on one goroutine, so a
 // failing seed reproduces exactly.
@@ -36,7 +38,13 @@ const (
 	rpcFail    = 0.1             // calls between Matchers, Registrars and the Bridge
 	storeFail  = 0.05            // persist mode: store writes that fail
 	gcTTL      = 8 * time.Second // idle clients collected after 8 rounds
+	outage     = 0.25            // persist mode: fraction of Matcher keys unwritable...
+	maxBacklog = 5               // ...without the Bridge's input piling up past this
 )
+
+// outages are the rounds [from, to) during which part of the Matcher key
+// space is unwritable (persist mode only).
+var outages = [][2]int{{60, 130}, {200, 260}}
 
 // store is the fake application database. Herald never sees its values,
 // only that versions go up; the global counter mimics a commit LSN.
@@ -131,12 +139,14 @@ func run(seed int64, st server.Store) []string {
 	if ms != nil {
 		ms.Fail = func() bool { return w.rng.Float64() < storeFail }
 	}
+	var fs *server.FaultyStore
 	if st != nil {
 		if _, err := st.Wipe(); err != nil { // start from empty state
 			return []string{"wipe: " + err.Error()}
 		}
+		fs = &server.FaultyStore{Store: st}
 		var err error
-		if w.cell, err = server.NewCellWithStore("sim", 3, 3, w.push, st); err != nil {
+		if w.cell, err = server.NewCellWithStore("sim", 3, 3, w.push, fs); err != nil {
 			return []string{"start: " + err.Error()}
 		}
 	} else {
@@ -169,19 +179,35 @@ func run(seed int64, st server.Store) []string {
 
 	// The Bridge's durable input log: a version leaves it only once the
 	// Matcher accepted it (Phase 5 gets this from the replication slot).
+	// Like the real Bridge it is consumed strictly in order, so one failing
+	// publish holds up everything behind it.
 	var backlog []p.Notification
 	publishBacklog := func() {
-		var keep []p.Notification
-		for _, n := range backlog {
-			if w.cell.Publish(n.Object, n.Version, "") != nil {
-				keep = append(keep, n)
-			}
+		for len(backlog) > 0 && w.cell.Publish(backlog[0].Object, backlog[0].Version, "") == nil {
+			backlog = backlog[1:]
 		}
-		backlog = keep
 	}
+	var violations []string
 
 	for round := 0; round < numRounds; round++ {
 		clock = clock.Add(time.Second)
+		for _, o := range outages {
+			if fs == nil {
+				break
+			}
+			switch round {
+			case o[0]:
+				fs.SetOutage(outage)
+			case o[1]:
+				fs.SetOutage(0)
+				// Unwritable versions were parked in scratch, so the input
+				// kept flowing (paper Sec. 4.2.6).
+				if len(backlog) > maxBacklog {
+					violations = append(violations,
+						fmt.Sprintf("round %d: Bridge backlog of %d versions after an outage", round, len(backlog)))
+				}
+			}
+		}
 		if round%10 == 0 {
 			_ = w.cell.GC(gcTTL) // a failed store write just leaves the client for next time
 		}
@@ -240,7 +266,6 @@ func run(seed int64, st server.Store) []string {
 	}
 
 	// Reliable delivery property (paper Sec. 5).
-	var violations []string
 	for _, a := range w.apps {
 		for _, id := range slices.Sorted(maps.Keys(a.want)) {
 			if got, want := a.cache[id], w.store.Get(id); got != want {

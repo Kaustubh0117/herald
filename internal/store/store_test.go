@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,6 +157,46 @@ func conformance(t *testing.T, st server.Store) {
 		}
 	}
 
+	// Scratch: versions of one object overwrite each other in a slot and
+	// never move back; another object can't take the slot; a delete only
+	// removes the exact version that was drained.
+	e := func(slot int, id p.ObjectID, v p.Version) server.ScratchEntry {
+		return server.ScratchEntry{Slot: slot, Object: id, Version: v, Source: "w"}
+	}
+	for _, x := range []struct {
+		e  server.ScratchEntry
+		ok bool
+	}{{e(7, "a", 5), true}, {e(7, "a", 3), true}, {e(7, "b", 9), false}} {
+		if ok, err := st.SaveScratch(x.e); ok != x.ok || err != nil {
+			t.Fatalf("SaveScratch(%+v) = %v, %v; want %v", x.e, ok, err, x.ok)
+		}
+	}
+	st.DeleteScratch(e(7, "a", 3)) // stale: a newer version is parked
+	if es, _ := st.LoadScratch(0, 1); len(es) != 1 || es[0] != e(7, "a", 5) {
+		t.Fatalf("scratch: %+v", es)
+	}
+	st.DeleteScratch(e(7, "a", 5))
+	if es, _ := st.LoadScratch(0, 1); len(es) != 0 {
+		t.Fatalf("drained entry still parked: %+v", es)
+	}
+	for i := 0; i < 30; i++ {
+		id := p.ObjectID(fmt.Sprintf("s%d", i))
+		st.SaveScratch(e(100+i, id, 1))
+	}
+	total = 0
+	for s := 0; s < 3; s++ {
+		es, _ := st.LoadScratch(s, 3)
+		for _, x := range es {
+			if p.Owner(string(x.Object), 3) != s {
+				t.Fatalf("%s drained by matcher %d, owned by %d", x.Object, s, p.Owner(string(x.Object), 3))
+			}
+		}
+		total += len(es)
+	}
+	if total != 30 {
+		t.Fatalf("scratch ranges should partition all 30 entries, got %d", total)
+	}
+
 	// Wipe empties everything and moves the epoch forward.
 	e2, err := st.Wipe()
 	if err != nil || e2 <= e1 {
@@ -166,6 +207,9 @@ func conformance(t *testing.T, st server.Store) {
 	}
 	if cs, _ := st.LoadRegistrar(0, 1); len(cs) != 0 {
 		t.Fatalf("wipe left registrar state: %+v", cs)
+	}
+	if es, _ := st.LoadScratch(0, 1); len(es) != 0 {
+		t.Fatalf("wipe left scratch entries: %+v", es)
 	}
 }
 
@@ -181,3 +225,30 @@ func compare(a, b p.ObjectID) int {
 
 func TestConformanceMemStore(t *testing.T) { conformance(t, server.NewMemStore()) }
 func TestConformancePostgres(t *testing.T) { conformance(t, openTest(t)) }
+
+// TestOldLayoutIsWiped: state keyed by a different partition hash would
+// load on the wrong servers, so Open throws it away (it is soft state).
+func TestOldLayoutIsWiped(t *testing.T) {
+	st := openTest(t)
+	st.SaveVersion("products:1", 5, "")
+	e1, _ := st.Epoch()
+	if err := st.exec(`UPDATE {S}.meta SET value = 1 WHERE key = 'layout'`); err != nil {
+		t.Fatal(err)
+	}
+	st2, err := Open(context.Background(), st.db, strings.Trim(st.s, `"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if objs, _ := st2.LoadMatcher(0, 1); len(objs) != 0 {
+		t.Fatalf("old-layout state survived: %+v", objs)
+	}
+	if e2, _ := st2.Epoch(); e2 <= e1 {
+		t.Fatalf("wipe must move the epoch forward: %d -> %d", e1, e2)
+	}
+	// Reopening under the current layout keeps the state.
+	st2.SaveVersion("products:1", 6, "")
+	st3, _ := Open(context.Background(), st.db, strings.Trim(st.s, `"`))
+	if objs, _ := st3.LoadMatcher(0, 1); len(objs) != 1 {
+		t.Fatalf("current-layout state was wiped: %+v", objs)
+	}
+}

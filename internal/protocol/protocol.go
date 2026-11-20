@@ -70,14 +70,29 @@ func DigestOf(ids map[ObjectID]bool) Digest {
 	return d
 }
 
-// hash32 is the partitioning hash. FNV-1a is fast, stable across runs and
-// machines, and spreads short strings well; it is not cryptographic, and
-// does not need to be.
+// hash32 is the partitioning hash: FNV-1a, which is fast and stable across
+// runs and machines, followed by MurmurHash3's finalizer. The finalizer
+// matters because Owner uses the TOP bits, and on its own FNV-1a barely
+// changes them when keys differ only at the end: "obj:0".."obj:19" all
+// landed on one of three servers. Not cryptographic, and needn't be.
+//
+// Changing this moves every key, so stored state must be wiped (see
+// LayoutVersion).
 func hash32(s string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(s))
-	return h.Sum32()
+	x := h.Sum32()
+	x ^= x >> 16
+	x *= 0x85ebca6b
+	x ^= x >> 13
+	x *= 0xc2b2ae35
+	x ^= x >> 16
+	return x
 }
+
+// LayoutVersion identifies hash32. A store written under a different
+// layout has its keys in the wrong ranges and must be wiped before use.
+const LayoutVersion = 2
 
 // PartitionKey prepends a hash of the ID to the ID itself, so keys spread
 // uniformly while staying readable (paper Sec. 4.1.1). It is also the

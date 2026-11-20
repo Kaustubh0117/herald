@@ -112,3 +112,20 @@ func TestKeyRangeAgreesWithOwner(t *testing.T) {
 		}
 	}
 }
+
+// TestOwnerSpreadsSequentialKeys: real IDs differ only at the end
+// ("products:41", "products:42"), and Owner must still spread them evenly.
+func TestOwnerSpreadsSequentialKeys(t *testing.T) {
+	for _, n := range []int{2, 3, 4, 7} {
+		counts := make([]int, n)
+		const keys = 10000
+		for i := 0; i < keys; i++ {
+			counts[Owner(fmt.Sprintf("products:%d", i), n)]++
+		}
+		for s, c := range counts {
+			if want := keys / n; c < want*9/10 || c > want*11/10 {
+				t.Errorf("n=%d: server %d owns %d of %d keys, want about %d", n, s, c, keys, want)
+			}
+		}
+	}
+}

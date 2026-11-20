@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"strings"
 	"time"
 
@@ -40,11 +41,33 @@ func Open(ctx context.Context, db *pgxpool.Pool, schema string) (*PG, error) {
 	var err error
 	for attempt := 0; attempt < 5; attempt++ {
 		if _, err = db.Exec(ctx, st.q(schemaSQL)); err == nil {
-			return st, nil
+			break
 		}
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
-	return nil, err
+	if err != nil {
+		return nil, err
+	}
+	return st, st.checkLayout(ctx)
+}
+
+// checkLayout wipes state written under a different partition hash
+// (protocol.LayoutVersion): its keys sit in the wrong servers' ranges. The
+// state is soft, so this costs clients one re-sync and nothing else.
+func (st *PG) checkLayout(ctx context.Context) error {
+	var layout int64
+	err := st.db.QueryRow(ctx, st.q(`SELECT value FROM {S}.meta WHERE key = 'layout'`)).Scan(&layout)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if layout == p.LayoutVersion {
+		return nil
+	}
+	if _, err := st.Wipe(); err != nil {
+		return err
+	}
+	return st.exec(`INSERT INTO {S}.meta (key, value) VALUES ('layout', $1)
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, p.LayoutVersion)
 }
 
 // q fills the schema into a statement.
@@ -84,7 +107,7 @@ func (st *PG) Wipe() (uint64, error) {
 	}
 	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx, st.q(`TRUNCATE {S}.matcher_objects, {S}.matcher_registrations,
-		{S}.registrar_clients, {S}.registrar_registrations, {S}.registrar_notifications`)); err != nil {
+		{S}.registrar_clients, {S}.registrar_registrations, {S}.registrar_notifications, {S}.scratch`)); err != nil {
 		return 0, err
 	}
 	var e int64
@@ -180,6 +203,63 @@ func (st *PG) LoadMatcher(i, n int) ([]server.StoredObject, error) {
 		out = append(out, *o)
 	}
 	return out, nil
+}
+
+// ---- Scratch (partial outages) ----
+
+func (st *PG) SaveScratch(e server.ScratchEntry) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	var owner string
+	err := st.db.QueryRow(ctx, st.q(`
+		INSERT INTO {S}.scratch AS s (slot, obj_pkey, object_id, version, source_client)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (slot) DO UPDATE
+		   SET version = EXCLUDED.version, source_client = EXCLUDED.source_client
+		 WHERE s.object_id = EXCLUDED.object_id AND s.version < EXCLUDED.version
+		RETURNING object_id`),
+		e.Slot, key(string(e.Object)), string(e.Object), int64(e.Version), string(e.Source)).Scan(&owner)
+	if err == nil {
+		return true, nil // inserted, or advanced our own older entry
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	// Nothing written: the slot holds another object, or already holds a
+	// version of ours at least as new (then we're done).
+	err = st.db.QueryRow(ctx, st.q(`SELECT object_id FROM {S}.scratch WHERE slot = $1`), e.Slot).Scan(&owner)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) { // no rows: drained meanwhile, try the next salt
+		return false, err
+	}
+	return owner == string(e.Object), nil
+}
+
+func (st *PG) DeleteScratch(e server.ScratchEntry) error {
+	return st.exec(`DELETE FROM {S}.scratch WHERE slot = $1 AND object_id = $2 AND version = $3`,
+		e.Slot, string(e.Object), int64(e.Version))
+}
+
+func (st *PG) LoadScratch(i, n int) ([]server.ScratchEntry, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	lo, hi := rangeArgs(i, n)
+	rows, err := st.db.Query(ctx, st.q(`SELECT slot, object_id, version, source_client
+		FROM {S}.scratch WHERE obj_pkey >= $1 AND ($2 = '' OR obj_pkey < $2)`), lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	var out []server.ScratchEntry
+	for rows.Next() {
+		var e server.ScratchEntry
+		var id, src string
+		var v int64
+		if err := rows.Scan(&e.Slot, &id, &v, &src); err != nil {
+			return nil, err
+		}
+		e.Object, e.Version, e.Source = p.ObjectID(id), p.Version(v), p.ClientID(src)
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // ---- Registrar view ----

@@ -227,6 +227,7 @@ func (c *Cell) Step() {
 		r.Propagate()
 	}
 	for _, m := range ms {
+		_ = m.Drain() // a failed scan is retried on the next step
 		m.Propagate()
 	}
 }
