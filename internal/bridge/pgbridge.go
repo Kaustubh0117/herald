@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	"github.com/Kaustubh0117/herald/internal/metrics"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 )
 
@@ -212,8 +213,10 @@ func (b *Bridge) publish(ctx context.Context, id p.ObjectID, v p.Version) error 
 	for {
 		err := b.Out.Publish(id, v, "")
 		if err == nil {
+			metrics.PublishTotal.Inc()
 			return nil
 		}
+		metrics.PublishRetries.Inc()
 		b.logf("bridge: publish %s@%d failed (retrying in %v): %v", id, v, backoff, err)
 		select {
 		case <-ctx.Done():
@@ -221,6 +224,38 @@ func (b *Bridge) publish(ctx context.Context, id p.ObjectID, v p.Version) error 
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, 2*time.Second)
+	}
+}
+
+// WatchLag samples the slot's lag into herald_bridge_slot_lag_bytes every
+// interval until ctx ends. It uses its own ordinary connection: the
+// replication connection is busy streaming.
+func WatchLag(ctx context.Context, dsn, slot string, interval time.Duration) {
+	var conn *pgx.Conn
+	defer func() {
+		if conn != nil {
+			conn.Close(context.Background())
+		}
+	}()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		if conn == nil {
+			conn, _ = pgx.Connect(ctx, dsn) // nil on failure: retried next tick
+		}
+		if conn != nil {
+			if lag, err := SlotLag(ctx, conn, slot); err == nil {
+				metrics.SlotLagBytes.Set(float64(lag))
+			} else {
+				conn.Close(context.Background())
+				conn = nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
 	}
 }
 

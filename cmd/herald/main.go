@@ -35,6 +35,7 @@ import (
 	"github.com/Kaustubh0117/herald/internal/bridge"
 	"github.com/Kaustubh0117/herald/internal/demo"
 	"github.com/Kaustubh0117/herald/internal/gateway"
+	"github.com/Kaustubh0117/herald/internal/metrics"
 	"github.com/Kaustubh0117/herald/internal/rpc"
 	"github.com/Kaustubh0117/herald/internal/server"
 	"github.com/Kaustubh0117/herald/internal/store"
@@ -242,6 +243,7 @@ func runRegistrar(ctx context.Context, cfg *Config, i int, st server.Store, gcTT
 		}
 		log.Printf("loaded state from Postgres (epoch %d)", e)
 	}
+	metrics.PendingNotifications(func() float64 { return float64(r.PendingNotifications()) })
 	go every(ctx, cfg.Step, r.Propagate)
 	go every(ctx, time.Minute, func() {
 		if err := r.GC(gcTTL); err != nil {
@@ -293,6 +295,7 @@ func runBridge(ctx context.Context, cfg *Config, pg, slot, pub string, demoSetup
 		db.Close()
 	}
 	b := &bridge.Bridge{DSN: pg, Slot: slot, Publication: pub, Out: matcherClients(cfg)}
+	go bridge.WatchLag(ctx, pg, slot, 5*time.Second)
 	for ctx.Err() == nil { // the slot makes every restart lossless
 		err := b.Run(ctx)
 		if ctx.Err() != nil {

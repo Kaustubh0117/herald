@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Kaustubh0117/herald/internal/metrics"
 	"github.com/Kaustubh0117/herald/internal/mutate"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 )
@@ -232,6 +233,7 @@ func (r *Registrar) Handle(m p.ClientMessage) (p.ServerMessage, error) {
 	// Reuse the client ID (paper Sec. 4.1.2); the empty digest in the reply
 	// makes the client send its full set.
 	if m.Token.Cell != r.cell || m.Token.Epoch != r.epoch {
+		metrics.Resyncs.WithLabelValues("new_token").Inc()
 		tok := p.Token{Client: m.Token.Client, Cell: r.cell, Epoch: r.epoch}
 		st, ok := r.clients[tok.Client]
 		if !ok {
@@ -251,6 +253,7 @@ func (r *Registrar) Handle(m p.ClientMessage) (p.ServerMessage, error) {
 		// ID; the token carries no cell, so the new ID's own Registrar treats
 		// it like a handshake. The new ID is derived, not random, to keep
 		// simulations reproducible.
+		metrics.Resyncs.WithLabelValues("zombie").Inc()
 		fresh := p.ClientID(fmt.Sprintf("%s.z%d", c, r.epoch))
 		return p.ServerMessage{NewToken: &p.Token{Client: fresh}, Nonce: m.Nonce}, nil
 	}
@@ -309,6 +312,9 @@ func (r *Registrar) Handle(m p.ClientMessage) (p.ServerMessage, error) {
 		Registered:   st.confirmReg,
 		Unregistered: st.confirmUnreg,
 	}
+	if resp.RequestSync {
+		metrics.Resyncs.WithLabelValues("digest_mismatch").Inc()
+	}
 	st.confirmReg, st.confirmUnreg = nil, nil
 	for _, id := range slices.Sorted(maps.Keys(st.pending)) { // retransmit everything unacked
 		resp.Notifications = append(resp.Notifications, st.pending[id])
@@ -320,6 +326,17 @@ func (r *Registrar) Handle(m p.ClientMessage) (p.ServerMessage, error) {
 		}
 	}
 	return resp, nil
+}
+
+// PendingNotifications counts unacked notifications across all clients.
+func (r *Registrar) PendingNotifications() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, st := range r.clients {
+		n += len(st.pending)
+	}
+	return n
 }
 
 // Deliver is called by Matchers. It stores the notification as pending
@@ -466,6 +483,7 @@ func (r *Registrar) postPropagate(op regOp, st *clientState, v p.Version, known 
 			return err
 		}
 		n = p.Notification{Object: op.obj, Unknown: true, Seq: st.seq}
+		metrics.UnknownNotifications.Inc()
 	}
 	if !mutate.NoPostPropagation {
 		if _, err := r.offer(op.client, st, n); err != nil {

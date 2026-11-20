@@ -105,6 +105,27 @@ only at the end, so `obj:0`..`obj:19` all landed on one of three servers. The pa
 now ends with MurmurHash3's finalizer. A store written under the old layout is wiped on open,
 because its keys sit in the wrong servers' ranges, and soft state makes that safe.
 
+## Observability
+
+Every process serves Prometheus metrics with `-metrics :9102`. `herald-dev` serves them on
+its own port at `/metrics`. The docker-compose cell also runs Prometheus and Grafana, with a
+provisioned dashboard ([deploy/grafana/dashboards/herald.json](deploy/grafana/dashboards/herald.json)):
+
+```sh
+docker compose -f deploy/docker-compose.yml up --build -d
+open http://localhost:3000      # Grafana, Herald dashboard, no login
+```
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `herald_bridge_slot_lag_bytes` | gauge | WAL Postgres retains for the slot; the early warning for everything |
+| `herald_publish_total`, `herald_publish_retries_total` | counter | Bridge throughput and health |
+| `herald_registrar_pending_notifications` | gauge | unacked backlog per Registrar |
+| `herald_resyncs_total{reason}` | counter | `new_token` (wipe/restart), `digest_mismatch`, `zombie` (GC) |
+| `herald_unknown_notifications_total` | counter | refetches caused by lost state; spikes after wipes |
+| `herald_clients_online` | gauge | open WebSockets per gateway |
+| `herald_scratch_buffered_total`, `herald_scratch_drained_total` | counter | partial storage outages (paper Fig. 11) |
+
 ## Develop
 
 ```sh

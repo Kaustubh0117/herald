@@ -21,6 +21,7 @@ import (
 	"github.com/Kaustubh0117/herald/internal/bridge"
 	"github.com/Kaustubh0117/herald/internal/demo"
 	"github.com/Kaustubh0117/herald/internal/gateway"
+	"github.com/Kaustubh0117/herald/internal/metrics"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 	"github.com/Kaustubh0117/herald/internal/server"
 	"github.com/Kaustubh0117/herald/internal/store"
@@ -61,6 +62,7 @@ func main() {
 		log.Printf("soft state in Postgres schema herald_dev: restarts reload it, Wipe truncates it")
 	}
 	gw = gateway.New("gw-dev", cell)
+	metrics.PendingNotifications(func() float64 { return float64(cell.PendingNotifications()) })
 
 	go func() { // propagator loops
 		for range time.Tick(*step) {
@@ -126,6 +128,7 @@ func main() {
 		}
 		http.Handle("GET /api/products", demo.Products(db))
 		go runBridge(ctx, &bridge.Bridge{DSN: *pg, Slot: *slot, Publication: *pub, Out: cell})
+		go bridge.WatchLag(ctx, *pg, *slot, 5*time.Second)
 	} else {
 		log.Printf("no -pg given: Bridge disabled; use POST /publish to send versions")
 	}

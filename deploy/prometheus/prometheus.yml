@@ -1,0 +1,13 @@
+# Scrapes every Herald process in the docker-compose cell. Each one serves
+# its own metrics on :9102 (the -metrics flag).
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: herald
+    static_configs:
+      - targets: ["bridge:9102", "matcher-0:9102", "registrar-0:9102", "registrar-1:9102", "gateway:9102"]
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: component

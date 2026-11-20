@@ -180,6 +180,15 @@ func (c *Cell) GC(ttl time.Duration) error {
 	return nil
 }
 
+// PendingNotifications counts unacked notifications on every Registrar.
+func (c *Cell) PendingNotifications() int {
+	n := 0
+	for i := range c.regs {
+		n += c.registrar(i).PendingNotifications()
+	}
+	return n
+}
+
 func (c *Cell) NumMatchers() int   { return len(c.ms) }
 func (c *Cell) NumRegistrars() int { return len(c.regs) }
 

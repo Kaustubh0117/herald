@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"github.com/Kaustubh0117/herald/internal/metrics"
 	p "github.com/Kaustubh0117/herald/internal/protocol"
 )
 
@@ -52,6 +53,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer c.CloseNow()
+	metrics.ClientsOnline.Inc()
+	defer metrics.ClientsOnline.Dec()
 	ctx := r.Context()
 
 	var me p.ClientID

@@ -1,7 +1,8 @@
 # A Herald cell as separate processes: bridge, matcher, two registrars and a
-# gateway, plus Postgres. From the repo root:
+# gateway, plus Postgres, Prometheus and Grafana. From the repo root:
 #   docker compose -f deploy/docker-compose.yml up --build
-#   open http://localhost:8080
+#   open http://localhost:8080          # demo page
+#   open http://localhost:3000          # Grafana: Herald dashboard
 #   docker compose -f deploy/docker-compose.yml kill matcher-0   # restarts empty
 # Every server restarts automatically; correctness must survive it.
 x-herald: &herald
@@ -24,27 +25,43 @@ services:
 
   bridge:
     <<: *herald
-    command: ["bridge", "-config", "/etc/herald/partitions.yaml", "-demo",
+    command: ["bridge", "-metrics", ":9102", "-config", "/etc/herald/partitions.yaml", "-demo",
               "-pg", "postgres://postgres:herald@postgres:5432/postgres", "-slot", "herald_cell_a"]
     depends_on: { postgres: { condition: service_healthy } }
 
   matcher-0:
     <<: *herald
-    command: ["matcher", "-config", "/etc/herald/partitions.yaml", "-i", "0"]
+    command: ["matcher", "-metrics", ":9102", "-config", "/etc/herald/partitions.yaml", "-i", "0"]
 
   registrar-0:
     <<: *herald
-    command: ["registrar", "-config", "/etc/herald/partitions.yaml", "-i", "0"]
+    command: ["registrar", "-metrics", ":9102", "-config", "/etc/herald/partitions.yaml", "-i", "0"]
 
   registrar-1:
     <<: *herald
-    command: ["registrar", "-config", "/etc/herald/partitions.yaml", "-i", "1"]
+    command: ["registrar", "-metrics", ":9102", "-config", "/etc/herald/partitions.yaml", "-i", "1"]
 
   gateway:
     <<: *herald
-    command: ["gateway", "-config", "/etc/herald/partitions.yaml", "-listen", ":8080",
+    command: ["gateway", "-metrics", ":9102", "-config", "/etc/herald/partitions.yaml", "-listen", ":8080",
               "-grpc", "gateway:7100", "-pg", "postgres://postgres:herald@postgres:5432/postgres"]
     ports: ["8080:8080"]
     depends_on: { postgres: { condition: service_healthy } }
 
-  # add prometheus + grafana here in Phase 10
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    volumes: ["./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:12.2.1
+    environment: # local dev only: no login
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/herald.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
